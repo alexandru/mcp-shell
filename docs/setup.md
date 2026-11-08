@@ -7,7 +7,7 @@ from a logged-in, non-root macOS account. It requires Git, stable Rust and Cargo
 the Xcode Command Line Tools C compiler, `openssl`, `plutil`, and `launchctl`.
 Install [Rust](https://www.rust-lang.org/tools/install) and the [Xcode Command
 Line Tools](https://developer.apple.com/xcode/resources/) if needed. The
-installer does not install `gh` or `az`; install the [GitHub CLI](https://cli.github.com/manual/installation)
+installer does not install `gh` or `az`; install the [GitHub CLI](https://github.com/cli/cli#installation)
 and [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
 if you want to use them.
 

@@ -3,7 +3,7 @@
 ## Prerequisites
 
 Install stable Rust/Cargo, Bash, Git, OpenSSL, and a C build toolchain. Install
-the [GitHub CLI](https://cli.github.com/manual/installation) or [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
+the [GitHub CLI](https://github.com/cli/cli#installation) or [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
 only if needed. See the [Rust installation guide](https://www.rust-lang.org/tools/install).
 Python 3 is required only for the optional authentication check.
 
