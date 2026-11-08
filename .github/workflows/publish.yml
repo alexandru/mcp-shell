@@ -1,0 +1,221 @@
+name: publish
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality-gate:
+    name: quality gate
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: quality-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            platform_name: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            platform_name: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set image name
+        id: image
+        run: printf 'image=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.image }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          file: backend/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ steps.image.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DIGEST" ]; then
+            echo "docker build did not produce a digest" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/digest-$PLATFORM.txt"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.platform_name }}
+          path: ${{ runner.temp }}/digests/digest-${{ matrix.platform_name }}.txt
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  publish:
+    name: publish manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image name
+        id: image
+        run: printf 'image=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute release version
+        id: release
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=""
+          if [ "$REF_TYPE" = "tag" ]; then
+            case "$REF_NAME" in
+              v?*)
+                candidate="${REF_NAME#v}"
+                if [[ "$candidate" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+                  version="$candidate"
+                else
+                  echo "tag $REF_NAME does not map to a valid image tag" >&2
+                  exit 1
+                fi
+                ;;
+            esac
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.image }}
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=${{ steps.release.outputs.version }},enable=${{ steps.release.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+
+      - name: Create and push manifest
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          ANNOTATIONS: ${{ steps.meta.outputs.annotations }}
+        run: |
+          set -euo pipefail
+
+          tag_args=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              tag_args+=(--tag "$tag")
+            fi
+          done <<< "$TAGS"
+          if [ "${#tag_args[@]}" -eq 0 ]; then
+            echo "no image tags were computed" >&2
+            exit 1
+          fi
+
+          annotation_args=()
+          while IFS= read -r annotation; do
+            if [ -n "$annotation" ]; then
+              annotation_args+=(--annotation "$annotation")
+            fi
+          done <<< "$ANNOTATIONS"
+
+          digest_refs=()
+          shopt -s nullglob
+          for digest_file in digests/*.txt; do
+            digest="$(tr -d '\r\n' < "$digest_file")"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid digest in $digest_file" >&2
+              exit 1
+            fi
+            digest_refs+=("$IMAGE@$digest")
+          done
+          if [ "${#digest_refs[@]}" -ne 2 ]; then
+            echo "expected 2 platform digests, found ${#digest_refs[@]}" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "${annotation_args[@]}" \
+            "${digest_refs[@]}"
+
+      - name: Verify published manifest
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          first_tag=""
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              first_tag="$tag"
+              break
+            fi
+          done <<< "$TAGS"
+          if [ -z "$first_tag" ]; then
+            echo "no image tags were computed" >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect "$first_tag"

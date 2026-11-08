@@ -1,0 +1,188 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: quality (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            platform_name: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            platform_name: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Run checks
+        working-directory: backend
+        run: cargo xtask check
+
+  docker:
+    name: docker (${{ matrix.platform }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            platform_name: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            platform_name: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: backend
+          file: backend/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          provenance: false
+          tags: backend:smoke-${{ matrix.platform_name }}
+
+      - name: Smoke test image
+        env:
+          IMAGE: backend:smoke-${{ matrix.platform_name }}
+          CONTAINER_TERM: backend-term-${{ matrix.platform_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          CONTAINER_INT: backend-int-${{ matrix.platform_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          TMP_DIR="$(mktemp -d "${RUNNER_TEMP}/backend-smoke.XXXXXX")"
+          printf 'Hello world\n' > "$TMP_DIR/expected.log"
+
+          cleanup() {
+            local trap_status=$?
+            trap - EXIT
+            if [ "$trap_status" -ne 0 ]; then
+              for container in "$CONTAINER_TERM" "$CONTAINER_INT"; do
+                echo "logs for $container:" >&2
+                docker logs "$container" >&2 || true
+              done
+            fi
+            docker rm --force "$CONTAINER_TERM" "$CONTAINER_INT" >/dev/null 2>&1 || true
+            rm -rf "$TMP_DIR"
+            exit "$trap_status"
+          }
+          trap cleanup EXIT
+
+          wait_for_greeting() {
+            local container="$1"
+            local output="$2"
+
+            for _ in $(seq 1 30); do
+              docker logs "$container" > "$output" 2>/dev/null || true
+              if grep -Fxq 'Hello world' "$output"; then
+                return 0
+              fi
+              running="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || printf 'false')"
+              if [ "$running" != "true" ]; then
+                echo "container $container exited before printing its greeting" >&2
+                return 1
+              fi
+              sleep 1
+            done
+
+            echo "timed out waiting for container $container to print Hello world" >&2
+            return 1
+          }
+
+          check_single_greeting() {
+            local output="$1"
+            if ! cmp -s "$TMP_DIR/expected.log" "$output"; then
+              echo "expected the complete output to be exactly Hello world followed by a newline" >&2
+              return 1
+            fi
+          }
+
+          docker run --detach --name "$CONTAINER_TERM" "$IMAGE" >/dev/null
+          wait_for_greeting "$CONTAINER_TERM" "$TMP_DIR/term.log"
+          sleep 2
+          running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER_TERM")"
+          if [ "$running" != "true" ]; then
+            echo "container did not stay running before SIGTERM" >&2
+            exit 1
+          fi
+          docker logs "$CONTAINER_TERM" > "$TMP_DIR/term.log"
+          check_single_greeting "$TMP_DIR/term.log"
+          docker stop --time 10 "$CONTAINER_TERM" >/dev/null
+          exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER_TERM")"
+          if [ "$exit_code" -ne 0 ]; then
+            echo "container exited with status $exit_code after SIGTERM" >&2
+            exit 1
+          fi
+          docker logs "$CONTAINER_TERM" > "$TMP_DIR/term.log"
+          check_single_greeting "$TMP_DIR/term.log"
+
+          docker run --detach --name "$CONTAINER_INT" "$IMAGE" >/dev/null
+          wait_for_greeting "$CONTAINER_INT" "$TMP_DIR/int.log"
+          sleep 2
+          running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER_INT")"
+          if [ "$running" != "true" ]; then
+            echo "container did not stay running before SIGINT" >&2
+            exit 1
+          fi
+          docker logs "$CONTAINER_INT" > "$TMP_DIR/int.log"
+          check_single_greeting "$TMP_DIR/int.log"
+          docker kill --signal SIGINT "$CONTAINER_INT" >/dev/null
+          exit_code="$(timeout 15s docker wait "$CONTAINER_INT")"
+          if [ "$exit_code" -ne 0 ]; then
+            echo "container exited with status $exit_code after SIGINT" >&2
+            exit 1
+          fi
+          docker logs "$CONTAINER_INT" > "$TMP_DIR/int.log"
+          check_single_greeting "$TMP_DIR/int.log"
+
+          echo "image smoke test passed"
+
+  complete:
+    name: build complete
+    needs: [quality, docker]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all build jobs to pass
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          DOCKER_RESULT: ${{ needs.docker.result }}
+        run: |
+          set -euo pipefail
+          printf 'quality: %s\ndocker: %s\n' "$QUALITY_RESULT" "$DOCKER_RESULT"
+          test "$QUALITY_RESULT" = success
+          test "$DOCKER_RESULT" = success
