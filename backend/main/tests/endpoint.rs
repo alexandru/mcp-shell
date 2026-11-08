@@ -787,11 +787,7 @@ fn read_process_id_marker(path: &Path) -> io::Result<Option<ProcessId>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let Some(last_line) = contents
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .next_back()
-    else {
+    let Some(last_line) = contents.lines().rfind(|line| !line.trim().is_empty()) else {
         return Ok(None);
     };
     let process_id = last_line.trim().parse::<u32>().map_err(io::Error::other)?;
@@ -2233,7 +2229,7 @@ fn curl_timeout_cancels_a_live_pipeline() -> TestResult {
         &mut group,
     )?;
     let client_status = client.wait_for_exit(Duration::from_secs(10))?;
-    assert!(!client_status.success(), "curl did not report its timeout");
+    assert_eq!(client_status.code(), Some(28));
     group.wait_until_stopped(Duration::from_secs(5))?;
     Ok(())
 }
