@@ -85,7 +85,9 @@ jobs:
           set -euo pipefail
 
           TMP_DIR="$(mktemp -d "${RUNNER_TEMP}/backend-smoke.XXXXXX")"
-          printf 'Hello world\n' > "$TMP_DIR/expected.log"
+          cat > "$TMP_DIR/config.toml" <<'EOF'
+          working_directory = "/app"
+          EOF
 
           cleanup() {
             local trap_status=$?
@@ -102,72 +104,62 @@ jobs:
           }
           trap cleanup EXIT
 
-          wait_for_greeting() {
+          wait_for_readiness() {
             local container="$1"
             local output="$2"
 
             for _ in $(seq 1 30); do
-              docker logs "$container" > "$output" 2>/dev/null || true
-              if grep -Fxq 'Hello world' "$output"; then
+              docker logs "$container" > "$output" 2>&1 || true
+              if grep -Fq 'mcp-shell listening on' "$output"; then
                 return 0
               fi
               running="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || printf 'false')"
               if [ "$running" != "true" ]; then
-                echo "container $container exited before printing its greeting" >&2
+                echo "container $container exited before reporting readiness" >&2
                 return 1
               fi
               sleep 1
             done
 
-            echo "timed out waiting for container $container to print Hello world" >&2
+            echo "timed out waiting for container $container to report readiness" >&2
             return 1
           }
 
-          check_single_greeting() {
-            local output="$1"
-            if ! cmp -s "$TMP_DIR/expected.log" "$output"; then
-              echo "expected the complete output to be exactly Hello world followed by a newline" >&2
-              return 1
-            fi
-          }
-
-          docker run --detach --name "$CONTAINER_TERM" "$IMAGE" >/dev/null
-          wait_for_greeting "$CONTAINER_TERM" "$TMP_DIR/term.log"
+          docker run --detach --name "$CONTAINER_TERM" \
+            --env MCP_SHELL_TOKEN_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --mount "type=bind,source=$TMP_DIR/config.toml,target=/app/config.toml,readonly" \
+            "$IMAGE" --config /app/config.toml >/dev/null
+          wait_for_readiness "$CONTAINER_TERM" "$TMP_DIR/term.log"
           sleep 2
           running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER_TERM")"
           if [ "$running" != "true" ]; then
             echo "container did not stay running before SIGTERM" >&2
             exit 1
           fi
-          docker logs "$CONTAINER_TERM" > "$TMP_DIR/term.log"
-          check_single_greeting "$TMP_DIR/term.log"
           docker stop --time 10 "$CONTAINER_TERM" >/dev/null
           exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER_TERM")"
           if [ "$exit_code" -ne 0 ]; then
             echo "container exited with status $exit_code after SIGTERM" >&2
             exit 1
           fi
-          docker logs "$CONTAINER_TERM" > "$TMP_DIR/term.log"
-          check_single_greeting "$TMP_DIR/term.log"
 
-          docker run --detach --name "$CONTAINER_INT" "$IMAGE" >/dev/null
-          wait_for_greeting "$CONTAINER_INT" "$TMP_DIR/int.log"
+          docker run --detach --name "$CONTAINER_INT" \
+            --env MCP_SHELL_TOKEN_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --mount "type=bind,source=$TMP_DIR/config.toml,target=/app/config.toml,readonly" \
+            "$IMAGE" --config /app/config.toml >/dev/null
+          wait_for_readiness "$CONTAINER_INT" "$TMP_DIR/int.log"
           sleep 2
           running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER_INT")"
           if [ "$running" != "true" ]; then
             echo "container did not stay running before SIGINT" >&2
             exit 1
           fi
-          docker logs "$CONTAINER_INT" > "$TMP_DIR/int.log"
-          check_single_greeting "$TMP_DIR/int.log"
           docker kill --signal SIGINT "$CONTAINER_INT" >/dev/null
           exit_code="$(timeout 15s docker wait "$CONTAINER_INT")"
           if [ "$exit_code" -ne 0 ]; then
             echo "container exited with status $exit_code after SIGINT" >&2
             exit 1
           fi
-          docker logs "$CONTAINER_INT" > "$TMP_DIR/int.log"
-          check_single_greeting "$TMP_DIR/int.log"
 
           echo "image smoke test passed"
 
