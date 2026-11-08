@@ -1,26 +1,27 @@
 use crate::config::{AllowRule, ConfigError};
 
-use super::{AuthorizedInvocation, PolicyError, authorize};
+use super::{AuthorizedExpression, PolicyError, authorize};
 
 fn rules(values: &[&str]) -> Result<Vec<AllowRule>, ConfigError> {
     values.iter().map(|value| AllowRule::parse(value)).collect()
 }
 
-fn invocation(
+fn expression(
     command: &str,
     allow_rules: &[&str],
-) -> Result<AuthorizedInvocation, Box<dyn std::error::Error>> {
+) -> Result<AuthorizedExpression, Box<dyn std::error::Error>> {
     Ok(authorize(command, &rules(allow_rules)?)?)
 }
 
-fn invocation_is_denied(
-    command: &str,
-    allow_rules: &[&str],
-) -> Result<bool, Box<dyn std::error::Error>> {
+fn is_not_allowed(command: &str, allow_rules: &[&str]) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(matches!(
         authorize(command, &rules(allow_rules)?),
         Err(PolicyError::NotAllowed)
     ))
+}
+
+fn is_rejected(command: &str, allow_rules: &[&str]) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(authorize(command, &rules(allow_rules)?).is_err())
 }
 
 #[test]
@@ -33,290 +34,233 @@ fn denies_commands_when_no_rules_are_configured() {
 
 #[test]
 fn allows_quote_decoded_literal_arguments() -> Result<(), Box<dyn std::error::Error>> {
-    let authorized = invocation(
-        "gh pr view \"123 with spaces\" --json title",
-        &["gh pr view*"],
-    )?;
+    let command = "gh pr view \"123 with spaces\" --json title";
+    let authorized = expression(command, &["gh pr view*"])?;
 
-    assert_eq!(authorized.program(), "gh");
-    assert_eq!(
-        authorized
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["pr", "view", "123 with spaces", "--json", "title"]
-    );
+    assert_eq!(authorized.script(), command);
     Ok(())
 }
 
 #[test]
-fn allows_quoted_literal_shell_metacharacters() -> Result<(), Box<dyn std::error::Error>> {
-    let single_quoted = invocation("/bin/echo 'literal|[value]'", &["/bin/echo *"])?;
-    let double_quoted = invocation("/bin/echo \"literal|[value]\"", &["/bin/echo *"])?;
-    let jq_expression = invocation("gh --jq '.[].labels[].name'", &["gh --jq*"])?;
+fn allows_the_requested_gh_pipeline_with_both_rule_styles() -> Result<(), Box<dyn std::error::Error>>
+{
+    let command = "gh pr view 123 --json title,body | head 10 >/tmp/out";
 
-    assert_eq!(single_quoted.arguments(), double_quoted.arguments());
-    assert_eq!(
-        single_quoted
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["literal|[value]"]
-    );
-    assert_eq!(
-        jq_expression
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["--jq", ".[].labels[].name"]
-    );
+    for allow_rules in [["gh *", "head *"], ["gh pr view*", "head*"]] {
+        let authorized = expression(command, &allow_rules)?;
+
+        assert_eq!(authorized.script(), command);
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_an_unauthorized_pipeline_member() -> Result<(), Box<dyn std::error::Error>> {
+    assert!(is_not_allowed("gh pr view 123 | cat", &["gh *"])?);
+    Ok(())
+}
+
+#[test]
+fn checks_commands_in_both_and_or_branches() -> Result<(), Box<dyn std::error::Error>> {
+    assert!(is_not_allowed("false && blocked", &["false"])?);
+    assert!(is_not_allowed("true || blocked", &["true"])?);
+    Ok(())
+}
+
+#[test]
+fn checks_every_command_in_semicolon_and_newline_lists() -> Result<(), Box<dyn std::error::Error>> {
+    assert!(is_not_allowed("gh pr view 1; blocked", &["gh *"])?);
+    assert!(is_not_allowed("gh pr view 1\nblocked", &["gh *"])?);
+
+    let command = "gh pr view 1; gh pr view 2\nhead 10";
+    let authorized = expression(command, &["gh *", "head *"])?;
+
+    assert_eq!(authorized.script(), command);
+    Ok(())
+}
+
+#[test]
+fn allows_literal_jq_arguments_and_quoted_metacharacters() -> Result<(), Box<dyn std::error::Error>>
+{
+    let command = "gh --jq '.[].labels[].name'";
+    let authorized = expression(command, &["gh --jq '.[].labels[].name'"])?;
+
+    assert_eq!(authorized.script(), command);
+    for command in [
+        "/bin/echo 'literal|[value]'",
+        "/bin/echo \"literal|[value]\"",
+    ] {
+        assert_eq!(expression(command, &["/bin/echo *"])?.script(), command);
+    }
     Ok(())
 }
 
 #[test]
 fn allows_single_quoted_expansion_text_as_a_literal() -> Result<(), Box<dyn std::error::Error>> {
-    let authorized = invocation("/bin/echo '$HOME $(whoami) `date`'", &["/bin/echo *"])?;
+    let command = "/bin/echo '$HOME $(whoami) `date`'";
 
-    assert_eq!(
-        authorized
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["$HOME $(whoami) `date`"]
-    );
+    assert_eq!(expression(command, &[command])?.script(), command);
     Ok(())
 }
 
 #[test]
-fn allows_escaped_unquoted_operators_as_literals() -> Result<(), Box<dyn std::error::Error>> {
-    let authorized = invocation(r"/bin/echo literal\|value \$HOME", &["/bin/echo *"])?;
+fn allows_escaped_unquoted_metacharacters_as_literals() -> Result<(), Box<dyn std::error::Error>> {
+    let command = r"/bin/echo literal\|value \$HOME";
+    let authorized = expression(command, &["/bin/echo literal|value $HOME"])?;
 
-    assert_eq!(
-        authorized
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["literal|value", "$HOME"]
-    );
+    assert_eq!(authorized.script(), command);
     Ok(())
 }
 
 #[test]
-fn allows_literal_newlines_inside_double_quotes() -> Result<(), Box<dyn std::error::Error>> {
-    let authorized = invocation("/bin/echo \"first\nsecond\"", &["/bin/echo *"])?;
-
-    assert_eq!(
-        authorized
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["first\nsecond"]
-    );
-    Ok(())
-}
-
-#[test]
-fn keeps_argument_boundaries_when_matching_exact_rules() -> Result<(), Box<dyn std::error::Error>> {
-    let authorized = invocation("/usr/bin/printf %s marker", &["/usr/bin/printf %s marker"])?;
-
-    assert_eq!(authorized.program(), "/usr/bin/printf");
-    assert_eq!(
-        authorized
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["%s", "marker"]
-    );
-    assert!(invocation_is_denied(
-        "/usr/bin/printf '%s marker'",
-        &["/usr/bin/printf %s marker"]
-    )?);
-    Ok(())
-}
-
-#[test]
-fn quoted_rule_matches_one_argument_and_rejects_split_arguments()
+fn allows_escaped_and_concatenated_literal_executable_words()
 -> Result<(), Box<dyn std::error::Error>> {
-    let rule = "/usr/bin/printf '%s marker'";
-    let authorized = invocation(rule, &[rule])?;
+    let escaped = r"/bin/ec\ho value";
+    let concatenated = "/bin/ec\"ho\" li\"teral\"";
 
-    assert_eq!(authorized.program(), "/usr/bin/printf");
+    assert_eq!(expression(escaped, &["/bin/echo value"])?.script(), escaped);
     assert_eq!(
-        authorized
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["%s marker"]
-    );
-    assert!(invocation_is_denied("/usr/bin/printf %s marker", &[rule])?);
-    Ok(())
-}
-
-#[test]
-fn equivalent_quote_spellings_authorize_the_same_arguments()
--> Result<(), Box<dyn std::error::Error>> {
-    let rule = "printf 'hello world'";
-    let single_quoted = invocation("printf 'hello world'", &[rule])?;
-    let double_quoted = invocation("printf \"hello world\"", &[rule])?;
-
-    assert_eq!(single_quoted.arguments(), double_quoted.arguments());
-    assert_eq!(
-        single_quoted
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["hello world"]
+        expression(concatenated, &["/bin/echo literal"])?.script(),
+        concatenated
     );
     Ok(())
 }
 
 #[test]
-fn distinguishes_an_empty_argument_from_no_arguments() -> Result<(), Box<dyn std::error::Error>> {
-    let with_empty_argument = invocation("printf ''", &["printf ''"])?;
-    let without_arguments = invocation("printf", &["printf"])?;
+fn skips_comment_text_when_authorizing_commands() -> Result<(), Box<dyn std::error::Error>> {
+    let command = "gh pr view 123 # | blocked; $(whoami)\n";
+    let authorized = expression(command, &["gh *"])?;
 
-    assert_eq!(
-        with_empty_argument
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec![""]
-    );
-    assert!(without_arguments.arguments().is_empty());
-    assert!(invocation_is_denied("printf", &["printf ''"])?);
-    assert!(invocation_is_denied("printf ''", &["printf"])?);
+    assert_eq!(authorized.script(), command);
     Ok(())
 }
 
 #[test]
-fn matches_prefix_wildcards_against_the_full_invocation() -> Result<(), Box<dyn std::error::Error>>
-{
-    let authorized = invocation("gh pr view 123 --json title,body", &["gh pr view*"])?;
-
-    assert_eq!(authorized.program(), "gh");
-    assert_eq!(
-        authorized
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["pr", "view", "123", "--json", "title,body"]
-    );
-    assert!(invocation_is_denied(
-        "ghsuffix pr view 123",
-        &["gh pr view*"]
-    )?);
-    Ok(())
-}
-
-#[test]
-fn trailing_space_star_rule_allows_a_bare_executable() -> Result<(), Box<dyn std::error::Error>> {
-    let authorized = invocation("head", &["head *"])?;
-    let with_arguments = invocation("head 10", &["head *"])?;
-
-    assert_eq!(authorized.program(), "head");
-    assert!(authorized.arguments().is_empty());
-    assert_eq!(with_arguments.program(), "head");
-    assert_eq!(
-        with_arguments
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["10"]
-    );
-    Ok(())
-}
-
-#[test]
-fn absolute_executable_paths_match_without_basename_fallback()
--> Result<(), Box<dyn std::error::Error>> {
-    assert!(invocation_is_denied("/usr/bin/gh pr view 123", &["gh *"])?);
-
-    let authorized = invocation("/usr/bin/gh pr view 123", &["/usr/bin/gh *"])?;
-
-    assert_eq!(authorized.program(), "/usr/bin/gh");
-    Ok(())
-}
-
-#[test]
-fn allows_literal_dots_in_paths_and_arguments() -> Result<(), Box<dyn std::error::Error>> {
-    let authorized = invocation("./tool.sh --file=.config/gh.yml", &["./tool.sh *"])?;
-
-    assert_eq!(authorized.program(), "./tool.sh");
-    assert_eq!(
-        authorized
-            .arguments()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["--file=.config/gh.yml"]
-    );
-    Ok(())
-}
-
-#[test]
-fn rejects_unquoted_shell_metacharacters_and_expansion_syntax() {
+fn allows_supported_file_redirects() -> Result<(), Box<dyn std::error::Error>> {
     for command in [
-        "gh pr | cat",
-        "gh pr; cat",
-        "gh pr && cat",
-        "gh pr < input",
-        "gh pr > output",
-        "gh pr $HOME",
-        "gh pr `whoami`",
-        "gh pr \"$HOME\"",
-        "gh pr \"$(whoami)\"",
-        "gh pr \"`whoami`\"",
-        "gh pr (view)",
-        "gh pr {view}",
-        "gh *",
-        "gh ?",
-        "gh [1]",
-        "gh ~",
-        "gh\0pr",
-        "gh\npr",
-        "gh\rpr",
-        "gh $(whoami)",
+        "/bin/echo output >/tmp/out",
+        "/bin/echo output >>/tmp/out",
+        "/bin/echo output </tmp/in",
+        "/bin/echo output 2>&1",
     ] {
+        assert_eq!(
+            expression(command, &["/bin/echo output"])?.script(),
+            command
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_expansion_in_redirect_destination() -> Result<(), Box<dyn std::error::Error>> {
+    let command = "/bin/echo output > \"$(touch /tmp/untrusted)\"";
+
+    assert!(is_rejected(command, &["/bin/echo output"])?);
+    Ok(())
+}
+
+#[test]
+fn rejects_dynamic_command_names_and_words() -> Result<(), Box<dyn std::error::Error>> {
+    for command in ["$cmd", "g*", "~/bin/gh", "{gh,cat}"] {
+        assert!(is_rejected(command, &["gh *", "cat *"])?);
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_expansions_inside_double_quotes() -> Result<(), Box<dyn std::error::Error>> {
+    for command in ["gh \"$HOME\"", "gh \"$(whoami)\"", "gh \"`whoami`\""] {
         assert!(matches!(
-            authorize(command, &[]),
+            authorize(command, &rules(&["gh *"])?),
             Err(PolicyError::UnsupportedShellSyntax)
         ));
     }
+    Ok(())
 }
 
 #[test]
-fn rejects_empty_commands_and_invalid_executable_words() {
+fn preserves_argument_boundaries_for_exact_rules() -> Result<(), Box<dyn std::error::Error>> {
+    let split_rule = "/usr/bin/printf %s marker";
+    let quoted_rule = "/usr/bin/printf '%s marker'";
+
+    assert_eq!(expression(split_rule, &[split_rule])?.script(), split_rule);
+    assert!(is_not_allowed(quoted_rule, &[split_rule])?);
+    assert_eq!(
+        expression(quoted_rule, &[quoted_rule])?.script(),
+        quoted_rule
+    );
+    assert!(is_not_allowed(split_rule, &[quoted_rule])?);
+    Ok(())
+}
+
+#[test]
+fn matches_equivalent_quote_spellings_as_the_same_arguments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rule = "printf 'hello world'";
+    let command = "printf \"hello world\"";
+
+    assert_eq!(expression(command, &[rule])?.script(), command);
+    Ok(())
+}
+
+#[test]
+fn distinguishes_empty_argument_from_no_arguments() -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(
+        expression("printf ''", &["printf ''"])?.script(),
+        "printf ''"
+    );
+    assert!(is_not_allowed("printf", &["printf ''"])?);
+    assert_eq!(expression("printf", &["printf"])?.script(), "printf");
+    assert!(is_not_allowed("printf ''", &["printf"])?);
+    Ok(())
+}
+
+#[test]
+fn allows_a_long_chain_of_static_commands() -> Result<(), Box<dyn std::error::Error>> {
+    let command = (0..2_000).map(|_| "true").collect::<Vec<_>>().join(";");
+    let authorized = expression(&command, &["true"])?;
+
+    assert_eq!(authorized.script(), command);
+    Ok(())
+}
+
+#[test]
+fn rejects_unquoted_operators_and_background_commands() -> Result<(), Box<dyn std::error::Error>> {
+    for command in ["gh |& cat", "gh &"] {
+        assert!(is_rejected(command, &["gh *", "cat *"])?);
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_unsupported_compound_shell_constructs() -> Result<(), Box<dyn std::error::Error>> {
+    for command in [
+        "foo=bar gh pr view 123",
+        "function helper { gh pr view 123; }",
+        "for item in one two; do gh pr view 123; done",
+        "(gh pr view 123)",
+        "cat <<EOF\ntext\nEOF",
+        "cat <<<text",
+    ] {
+        assert!(is_rejected(command, &["gh *", "cat *"])?);
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_malformed_empty_and_comment_only_inputs() -> Result<(), Box<dyn std::error::Error>> {
     assert!(matches!(authorize("", &[]), Err(PolicyError::EmptyCommand)));
     assert!(matches!(
         authorize("   ", &[]),
         Err(PolicyError::EmptyCommand)
     ));
     assert!(matches!(
-        authorize("\"\" argument", &[]),
-        Err(PolicyError::InvalidExecutable)
+        authorize("# comment only", &[]),
+        Err(PolicyError::EmptyCommand)
     ));
     assert!(matches!(
-        authorize("FOO=bar gh", &[]),
-        Err(PolicyError::InvalidExecutable)
+        authorize("gh 'unterminated", &rules(&["gh *"])?),
+        Err(PolicyError::InvalidSyntax)
     ));
-}
-
-#[test]
-fn rejects_malformed_quotes() {
-    assert!(matches!(
-        authorize("gh 'pr view", &[]),
-        Err(PolicyError::InvalidQuoting)
-    ));
+    Ok(())
 }

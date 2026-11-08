@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{self, BufRead, BufReader},
     net::{Ipv4Addr, SocketAddr, TcpListener},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStderr, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -27,13 +27,44 @@ allow_rules = {allow_rules}
 max_runtime_ms = 5000
 max_output_bytes = 1048576
 max_concurrent = {max_concurrent}
+{optional_config}
 "#;
+const DEFAULT_ALLOW_RULES: &[&str] = &["/usr/bin/printf *", "/bin/echo *", "/usr/bin/false *"];
+const DEFAULT_MAX_CONCURRENT: usize = 4;
 
 static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(0);
 
 type HttpStatusCode = u16;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[derive(Clone, Copy)]
+struct FixtureFile<'a> {
+    relative_path: &'a str,
+    contents: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum TestEnvironmentValue<'a> {
+    Literal(&'a str),
+    FixturePath(&'a str),
+}
+
+#[derive(Clone, Copy)]
+struct TestEnvironment<'a> {
+    name: &'a str,
+    value: TestEnvironmentValue<'a>,
+}
+
+#[derive(Default)]
+struct ServerOptions<'a> {
+    allow_rules: Option<&'a [&'a str]>,
+    max_concurrent: Option<usize>,
+    initialization_file: Option<FixtureFile<'a>>,
+    additional_files: &'a [FixtureFile<'a>],
+    working_directory: Option<&'a str>,
+    environment: &'a [TestEnvironment<'a>],
+}
 
 struct TestDirectory {
     path: PathBuf,
@@ -72,6 +103,29 @@ impl Drop for TestDirectory {
     }
 }
 
+fn write_fixture_file(root: &Path, file: FixtureFile<'_>) -> io::Result<PathBuf> {
+    let path = root.join(file.relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, file.contents)?;
+    Ok(path)
+}
+
+fn append_config_path(configuration: &mut String, key: &str, path: &Path) -> TestResult {
+    let value = path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixture configuration path is not valid UTF-8",
+        )
+    })?;
+    configuration.push_str(key);
+    configuration.push_str(" = ");
+    configuration.push_str(&serde_json::to_string(value)?);
+    configuration.push('\n');
+    Ok(())
+}
+
 struct ChildGuard {
     child: Child,
     stopped: bool,
@@ -106,30 +160,73 @@ struct ServerFixture {
 
 impl ServerFixture {
     fn start() -> TestResult<Self> {
-        Self::start_with_rules(&["/usr/bin/printf *", "/bin/echo *", "/usr/bin/false *"], 4)
+        Self::start_with_options(ServerOptions::default())
     }
 
     fn start_with_rules(allow_rules: &[&str], max_concurrent: usize) -> TestResult<Self> {
+        Self::start_with_options(ServerOptions {
+            allow_rules: Some(allow_rules),
+            max_concurrent: Some(max_concurrent),
+            ..ServerOptions::default()
+        })
+    }
+
+    fn start_with_options(options: ServerOptions<'_>) -> TestResult<Self> {
         let directory = TestDirectory::create()?;
+        for file in options.additional_files {
+            write_fixture_file(&directory.path, *file)?;
+        }
+        let initialization_file = options
+            .initialization_file
+            .map(|file| write_fixture_file(&directory.path, file))
+            .transpose()?;
+        let working_directory = options
+            .working_directory
+            .map(|path| directory.path.join(path));
+        if let Some(path) = working_directory.as_ref() {
+            fs::create_dir_all(path)?;
+        }
+
         let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = reservation.local_addr()?.port();
         drop(reservation);
         let config_path = directory.path.join("server.toml");
-        let allow_rules = serde_json::to_string(allow_rules)?;
+        let allow_rules =
+            serde_json::to_string(options.allow_rules.unwrap_or(DEFAULT_ALLOW_RULES))?;
+        let max_concurrent = options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
+        let mut optional_config = String::new();
+        if let Some(path) = initialization_file.as_deref() {
+            append_config_path(&mut optional_config, "initialization_file", path)?;
+        }
+        if let Some(path) = working_directory.as_deref() {
+            append_config_path(&mut optional_config, "working_directory", path)?;
+        }
         let config = CONFIG
             .replace("{port}", &port.to_string())
             .replace("{allow_rules}", &allow_rules)
-            .replace("{max_concurrent}", &max_concurrent.to_string());
+            .replace("{max_concurrent}", &max_concurrent.to_string())
+            .replace("{optional_config}", &optional_config);
         fs::write(&config_path, config)?;
 
-        let child = Command::new(env!("CARGO_BIN_EXE_backend"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_backend"));
+        command
             .arg("--config")
             .arg(&config_path)
             .current_dir(&directory.path)
             .env_clear()
-            .env("MCP_SHELL_TOKEN_SHA256", TOKEN_SHA256)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        for variable in options.environment {
+            let value = match variable.value {
+                TestEnvironmentValue::Literal(value) => value.into(),
+                TestEnvironmentValue::FixturePath(path) => {
+                    directory.path.join(path).into_os_string()
+                }
+            };
+            command.env(variable.name, value);
+        }
+        let child = command
+            .env("MCP_SHELL_TOKEN_SHA256", TOKEN_SHA256)
             .spawn()?;
         let mut child = ChildGuard {
             child,
@@ -853,6 +950,348 @@ fn signal_termination_is_reported_and_releases_execution_capacity() -> TestResul
             .pointer("/result/structuredContent/exit_code")
             .and_then(Value::as_i64),
         Some(0)
+    );
+    Ok(())
+}
+
+#[test]
+fn runs_pipeline_and_file_redirections_with_paths_containing_spaces() -> TestResult {
+    let server = ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(&["/usr/bin/printf *", "/usr/bin/head *", "/bin/cat"]),
+        working_directory: Some("working directory with spaces"),
+        ..ServerOptions::default()
+    })?;
+    let pipeline = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({
+            "command": "/usr/bin/printf 'first\\nsecond\\n' | /usr/bin/head -n 1 > 'pipeline result.txt'"
+        })),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    assert_eq!(pipeline.status, 200);
+    let pipeline_message = pipeline.mcp_message()?;
+    assert_eq!(
+        pipeline_message
+            .pointer("/result/isError")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        pipeline_message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some("")
+    );
+    assert_eq!(
+        pipeline_message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+
+    let read_back = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/bin/cat < 'pipeline result.txt'"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_eq!(read_back.status, 200);
+    let read_back_message = read_back.mcp_message()?;
+    assert_eq!(
+        read_back_message
+            .pointer("/result/isError")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        read_back_message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some("first\n")
+    );
+    assert_eq!(
+        read_back_message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    Ok(())
+}
+
+#[test]
+fn executes_and_or_semicolon_and_newline_lists() -> TestResult {
+    let server = ServerFixture::start_with_rules(&["/bin/echo *"], 1)?;
+    let response = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({
+            "command": "/bin/echo first && /bin/echo second || /bin/echo fallback; /bin/echo semicolon\n/bin/echo newline"
+        })),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    assert_eq!(response.status, 200);
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some("first\nsecond\nsemicolon\nnewline\n")
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_later_unauthorized_short_circuit_branch_before_shell_side_effects() -> TestResult {
+    let server = ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(&["/usr/bin/false *"]),
+        initialization_file: Some(FixtureFile {
+            relative_path: "trusted init file.bash",
+            contents: "printf x >> 'init marker.txt'\n",
+        }),
+        working_directory: Some("working directory with spaces"),
+        ..ServerOptions::default()
+    })?;
+    let response = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({
+            "command": "/usr/bin/false no > 'redirect marker.txt' && /usr/bin/touch 'untaken marker.txt'"
+        })),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    assert_eq!(response.status, 200);
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(true)
+    );
+    let working_directory = server.directory.path.join("working directory with spaces");
+    assert!(!working_directory.join("init marker.txt").exists());
+    assert!(!working_directory.join("redirect marker.txt").exists());
+    assert!(!working_directory.join("untaken marker.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn loads_init_aliases_and_functions_per_execution_without_losing_the_expression() -> TestResult {
+    let initialization_file = FixtureFile {
+        relative_path: "trusted init file.bash",
+        contents: r#"
+printf x >> 'init marker with spaces.txt'
+set -- clobbered
+alias emit='printf "%s\n" "alias output"'
+report() { printf '%s\n' "$1"; }
+report_env() { printf '%s|%s|%s\n' "$HOME" "$PATH" "$MCP_TEST_AUTH"; }
+"#,
+    };
+    let server = ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(&["cd /", "/bin/pwd", "emit", "report *", "report_env"]),
+        initialization_file: Some(initialization_file),
+        working_directory: Some("working directory with spaces"),
+        environment: &[
+            TestEnvironment {
+                name: "HOME",
+                value: TestEnvironmentValue::Literal("/synthetic/home path"),
+            },
+            TestEnvironment {
+                name: "PATH",
+                value: TestEnvironmentValue::Literal("/synthetic/bin:/usr/bin:/bin"),
+            },
+            TestEnvironment {
+                name: "MCP_TEST_AUTH",
+                value: TestEnvironmentValue::Literal("synthetic-auth-value"),
+            },
+        ],
+        ..ServerOptions::default()
+    })?;
+
+    let changed_directory = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "cd /; /bin/pwd"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_eq!(changed_directory.status, 200);
+    let changed_directory_message = changed_directory.mcp_message()?;
+    assert_eq!(
+        changed_directory_message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some("/\n")
+    );
+    assert_eq!(
+        changed_directory_message
+            .pointer("/result/isError")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let initialized = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({
+            "command": "emit; report 'function output with spaces'; report_env; /bin/pwd"
+        })),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_eq!(initialized.status, 200);
+    let initialized_message = initialized.mcp_message()?;
+    assert_eq!(
+        initialized_message
+            .pointer("/result/isError")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    let expected_working_directory = server.directory.path.join("working directory with spaces");
+    let expected_working_directory = expected_working_directory.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixture working directory is not valid UTF-8",
+        )
+    })?;
+    let expected_stdout = format!(
+        "alias output\nfunction output with spaces\n/synthetic/home path|/synthetic/bin:/usr/bin:/bin|synthetic-auth-value\n{expected_working_directory}\n"
+    );
+    assert_eq!(
+        initialized_message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some(expected_stdout.as_str())
+    );
+    assert_eq!(
+        initialized_message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+
+    let initialization_marker = server
+        .directory
+        .path
+        .join("working directory with spaces")
+        .join("init marker with spaces.txt");
+    assert_eq!(fs::read_to_string(initialization_marker)?, "xx");
+    Ok(())
+}
+
+#[test]
+fn nonzero_init_status_prevents_client_expression_side_effects() -> TestResult {
+    let server = ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(&["/usr/bin/touch *"]),
+        initialization_file: Some(FixtureFile {
+            relative_path: "failing init file.bash",
+            contents: "return 17\n",
+        }),
+        ..ServerOptions::default()
+    })?;
+    let target = server.directory.path.join("client side effect.txt");
+    let response = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({
+            "command": "/usr/bin/touch 'client side effect.txt'"
+        })),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    assert_eq!(response.status, 200);
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(17)
+    );
+    assert!(!target.exists());
+    Ok(())
+}
+
+#[test]
+fn strips_inherited_shell_hooks_and_keeps_configured_initialization() -> TestResult {
+    let server = ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(&["say"]),
+        initialization_file: Some(FixtureFile {
+            relative_path: "trusted init file.bash",
+            contents: "alias say='printf %s configured-init'\n",
+        }),
+        additional_files: &[FixtureFile {
+            relative_path: "inherited BASH_ENV file.bash",
+            contents: "/usr/bin/touch 'BASH_ENV marker.txt'\n",
+        }],
+        environment: &[
+            TestEnvironment {
+                name: "BASH_ENV",
+                value: TestEnvironmentValue::FixturePath("inherited BASH_ENV file.bash"),
+            },
+            TestEnvironment {
+                name: "BASH_FUNC_printf%%",
+                value: TestEnvironmentValue::Literal(
+                    "() { /usr/bin/touch 'printf function marker.txt'; }",
+                ),
+            },
+        ],
+        ..ServerOptions::default()
+    })?;
+    let response = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "say"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    assert_eq!(response.status, 200);
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some("configured-init")
+    );
+    assert!(!server.directory.path.join("BASH_ENV marker.txt").exists());
+    assert!(
+        !server
+            .directory
+            .path
+            .join("printf function marker.txt")
+            .exists()
     );
     Ok(())
 }
