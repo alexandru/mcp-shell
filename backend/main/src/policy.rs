@@ -52,6 +52,7 @@ pub(crate) fn authorize(
     if root.has_error() {
         return Err(PolicyError::InvalidSyntax);
     }
+    let mut coverage = SourceCoverage::new(command);
     let mut pending = vec![root];
     let mut has_invocation = false;
     while let Some(node) = pending.pop() {
@@ -59,14 +60,20 @@ pub(crate) fn authorize(
             return Err(PolicyError::InvalidSyntax);
         }
         match node.kind() {
-            "comment" => (),
+            "comment" => coverage.mark_comment(node)?,
             "program" | "pipeline" | "list" => {
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
                     if child.is_named() {
                         pending.push(child);
-                    } else if !supported_operator(node.kind(), child.kind()) {
-                        return Err(PolicyError::UnsupportedShellSyntax);
+                    } else {
+                        let Some(spelling) = supported_operator(node.kind(), child.kind()) else {
+                            return Err(PolicyError::UnsupportedShellSyntax);
+                        };
+                        if node_text(child, command)? != spelling {
+                            return Err(PolicyError::UnsupportedShellSyntax);
+                        }
+                        coverage.mark_span(child.byte_range())?;
                     }
                 }
             }
@@ -77,17 +84,21 @@ pub(crate) fn authorize(
                 pending.push(body);
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    if child == body || child.kind() == "comment" {
+                    if child == body {
+                        continue;
+                    }
+                    if child.kind() == "comment" {
+                        coverage.mark_comment(child)?;
                         continue;
                     }
                     if child.kind() != "file_redirect" {
                         return Err(PolicyError::UnsupportedShellSyntax);
                     }
-                    validate_redirect(child, command)?;
+                    validate_redirect(child, command, &mut coverage)?;
                 }
             }
             "command" => {
-                authorize_command(node, command, rules)?;
+                authorize_command(node, command, rules, &mut coverage)?;
                 has_invocation = true;
             }
             _ => return Err(PolicyError::UnsupportedShellSyntax),
@@ -96,6 +107,7 @@ pub(crate) fn authorize(
     if !has_invocation {
         return Err(PolicyError::EmptyCommand);
     }
+    coverage.validate()?;
     Ok(AuthorizedExpression {
         script: command.to_owned(),
     })
@@ -104,18 +116,71 @@ pub(crate) fn authorize(
 type ExpressionText = String;
 type LiteralWord = String;
 
-fn supported_operator(parent: &str, operator: &str) -> bool {
-    matches!(
-        (parent, operator),
-        ("program", ";" | "\n") | ("pipeline", "|") | ("list", "&&" | "||")
-    )
+// Tree-sitter grammar extras may discard bytes that Bash treats as word content.
+// Only checked atoms and ASCII separators may pass source coverage.
+struct SourceCoverage<'a> {
+    source: &'a str,
+    covered: Vec<bool>,
 }
 
-fn authorize_command(node: Node<'_>, source: &str, rules: &[AllowRule]) -> Result<(), PolicyError> {
+impl<'a> SourceCoverage<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            covered: vec![false; source.len()],
+        }
+    }
+
+    fn mark_span(&mut self, range: std::ops::Range<usize>) -> Result<(), PolicyError> {
+        let Some(coverage_span) = self.covered.get_mut(range) else {
+            return Err(PolicyError::InvalidSyntax);
+        };
+        coverage_span.fill(true);
+        Ok(())
+    }
+
+    fn mark_comment(&mut self, node: Node<'_>) -> Result<(), PolicyError> {
+        if node_text(node, self.source)?.contains('\n') {
+            return Err(PolicyError::UnsupportedShellSyntax);
+        }
+        self.mark_span(node.byte_range())
+    }
+
+    fn validate(&self) -> Result<(), PolicyError> {
+        let has_uncovered_syntax = self
+            .source
+            .as_bytes()
+            .iter()
+            .zip(&self.covered)
+            .any(|(byte, covered)| !covered && !matches!(*byte, b' ' | b'\t' | b'\n'));
+        if has_uncovered_syntax {
+            return Err(PolicyError::UnsupportedShellSyntax);
+        }
+        Ok(())
+    }
+}
+
+fn supported_operator(parent: &str, operator: &str) -> Option<&'static str> {
+    match (parent, operator) {
+        ("program", ";") => Some(";"),
+        ("program", "\n") => Some("\n"),
+        ("pipeline", "|") => Some("|"),
+        ("list", "&&") => Some("&&"),
+        ("list", "||") => Some("||"),
+        _ => None,
+    }
+}
+
+fn authorize_command(
+    node: Node<'_>,
+    source: &str,
+    rules: &[AllowRule],
+    coverage: &mut SourceCoverage<'_>,
+) -> Result<(), PolicyError> {
     let name = node
         .child_by_field_name("name")
         .ok_or(PolicyError::InvalidExecutable)?;
-    let executable = literal_word(name, source)?;
+    let executable = literal_word(name, source, coverage)?;
     if executable.is_empty() {
         return Err(PolicyError::InvalidExecutable);
     }
@@ -123,12 +188,15 @@ fn authorize_command(node: Node<'_>, source: &str, rules: &[AllowRule]) -> Resul
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child == name || child.kind() == "comment" {
+            if child.kind() == "comment" {
+                coverage.mark_comment(child)?;
+            }
             continue;
         }
         if child.kind() == "file_redirect" {
-            validate_redirect(child, source)?;
+            validate_redirect(child, source, coverage)?;
         } else {
-            words.push(literal_word(child, source)?);
+            words.push(literal_word(child, source, coverage)?);
         }
     }
     let invocation = words.join("\0");
@@ -142,27 +210,43 @@ fn authorize_command(node: Node<'_>, source: &str, rules: &[AllowRule]) -> Resul
     }
 }
 
-fn validate_redirect(node: Node<'_>, source: &str) -> Result<(), PolicyError> {
+fn validate_redirect(
+    node: Node<'_>,
+    source: &str,
+    coverage: &mut SourceCoverage<'_>,
+) -> Result<(), PolicyError> {
     let mut operator = None;
+    let mut operator_node = None;
     let mut destinations = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "comment" {
+            coverage.mark_comment(child)?;
             continue;
         }
         if !child.is_named() {
             operator = Some(child.kind());
+            operator_node = Some(child);
         } else if child.kind() == "file_descriptor" {
             if !standard_descriptor(node_text(child, source)?) {
                 return Err(PolicyError::UnsupportedShellSyntax);
             }
+            coverage.mark_span(child.byte_range())?;
         } else {
-            destinations.push(literal_word(child, source)?);
+            destinations.push(literal_word(child, source, coverage)?);
         }
     }
+    let operator = operator.ok_or(PolicyError::UnsupportedShellSyntax)?;
+    let operator_node = operator_node.ok_or(PolicyError::UnsupportedShellSyntax)?;
+    let operator_text = node_text(operator_node, source)?;
+    if operator_text != operator {
+        return Err(PolicyError::UnsupportedShellSyntax);
+    }
     match (operator, destinations.as_slice()) {
-        (Some(">" | ">>" | "<"), [_]) => Ok(()),
-        (Some(">&" | "<&"), [destination]) if standard_descriptor(destination) => Ok(()),
+        (">" | ">>" | "<", [_]) => coverage.mark_span(operator_node.byte_range()),
+        (">&" | "<&", [destination]) if standard_descriptor(destination) => {
+            coverage.mark_span(operator_node.byte_range())
+        }
         _ => Err(PolicyError::UnsupportedShellSyntax),
     }
 }
@@ -171,7 +255,11 @@ fn standard_descriptor(value: &str) -> bool {
     matches!(value, "0" | "1" | "2")
 }
 
-fn literal_word(node: Node<'_>, source: &str) -> Result<LiteralWord, PolicyError> {
+fn literal_word(
+    node: Node<'_>,
+    source: &str,
+    coverage: &mut SourceCoverage<'_>,
+) -> Result<LiteralWord, PolicyError> {
     let mut pending = vec![node];
     while let Some(part) = pending.pop() {
         if !matches!(
@@ -206,6 +294,7 @@ fn literal_word(node: Node<'_>, source: &str) -> Result<LiteralWord, PolicyError
     if words.next().is_some() {
         return Err(PolicyError::UnsupportedShellSyntax);
     }
+    coverage.mark_span(node.byte_range())?;
     Ok(word)
 }
 

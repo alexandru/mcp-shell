@@ -12,6 +12,8 @@ Expressions may contain:
 - Input and output redirection with `<`, `>`, and `>>`, plus duplication of standard file descriptors 0, 1, and 2, such as `2>&1`.
 - Quoting and escapes that produce literal words, including quoted or escaped metacharacters.
 
+Unquoted spaces and tabs separate words; newlines separate commands. Quote argument values that contain leading whitespace or control whitespace, such as tabs or newlines, to preserve that whitespace. Unquoted escaped leading whitespace and unquoted backslash-newline continuations are not supported.
+
 The server rejects syntax errors and unsupported or unknown constructs. Client expressions cannot contain function-definition syntax, use loops, conditionals, subshells or background commands, or use heredocs, here-strings, variable assignments, or variable, command, process, arithmetic, tilde, glob, or brace expansion. Quoting does not make an expansion literal: for example, `"$HOME"` is still an expansion and is rejected.
 
 ## Allow rules

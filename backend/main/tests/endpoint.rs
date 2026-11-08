@@ -30,12 +30,13 @@ max_concurrent = {max_concurrent}
 {optional_config}
 "#;
 const DEFAULT_ALLOW_RULES: &[&str] = &["/usr/bin/printf *", "/bin/echo *", "/usr/bin/false *"];
-const DEFAULT_MAX_CONCURRENT: usize = 4;
+const DEFAULT_MAX_CONCURRENT: ExecutionConcurrency = 4;
 
 static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(0);
 
 type HttpStatusCode = u16;
+type ExecutionConcurrency = usize;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 #[derive(Clone, Copy)]
@@ -59,7 +60,7 @@ struct TestEnvironment<'a> {
 #[derive(Default)]
 struct ServerOptions<'a> {
     allow_rules: Option<&'a [&'a str]>,
-    max_concurrent: Option<usize>,
+    max_concurrent: Option<ExecutionConcurrency>,
     initialization_file: Option<FixtureFile<'a>>,
     additional_files: &'a [FixtureFile<'a>],
     working_directory: Option<&'a str>,
@@ -163,7 +164,10 @@ impl ServerFixture {
         Self::start_with_options(ServerOptions::default())
     }
 
-    fn start_with_rules(allow_rules: &[&str], max_concurrent: usize) -> TestResult<Self> {
+    fn start_with_rules(
+        allow_rules: &[&str],
+        max_concurrent: ExecutionConcurrency,
+    ) -> TestResult<Self> {
         Self::start_with_options(ServerOptions {
             allow_rules: Some(allow_rules),
             max_concurrent: Some(max_concurrent),
@@ -504,6 +508,28 @@ fn assert_invalid_params(response: &HttpResponse) -> io::Result<()> {
         message.pointer("/error/code").and_then(Value::as_i64),
         Some(-32602)
     );
+    Ok(())
+}
+
+fn assert_policy_rejected_before_execution(
+    response: &HttpResponse,
+    side_effect: &Path,
+) -> io::Result<()> {
+    assert_eq!(response.status, 200);
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        message
+            .pointer("/result/structuredContent/error")
+            .and_then(Value::as_str)
+            .is_some()
+    );
+    assert_eq!(message.pointer("/result/structuredContent/stdout"), None);
+    assert_eq!(message.pointer("/result/structuredContent/exit_code"), None);
+    assert!(!side_effect.exists());
     Ok(())
 }
 
@@ -874,6 +900,132 @@ fn exact_allow_rule_preserves_argument_boundaries() -> TestResult {
     assert_eq!(
         denied_message.pointer("/result/structuredContent/stdout"),
         None
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_escaped_whitespace_and_control_prefixes_before_execution() -> TestResult {
+    let server = ServerFixture::start_with_rules(&["/usr/bin/printf %s marker"], 1)?;
+    let inputs = [
+        ("escaped-prefix", "\\ /usr/bin/printf %s marker"),
+        ("carriage-return-prefix", "\r/usr/bin/printf %s marker"),
+        ("vertical-tab-prefix", "\u{000b}/usr/bin/printf %s marker"),
+        ("form-feed-prefix", "\u{000c}/usr/bin/printf %s marker"),
+        ("escaped-leading-argument", "/usr/bin/printf %s \\ marker"),
+    ];
+
+    for (name, invocation) in inputs {
+        let target_name = format!("{name} side effect.txt");
+        let target = server.directory.path.join(&target_name);
+        let command = format!("{invocation} > '{target_name}'");
+        let response = server.post(
+            "tools/call",
+            Some("execute"),
+            &tool_call_body(json!({"command": command})),
+            Some(TOKEN),
+            "127.0.0.1",
+            None,
+        )?;
+
+        assert_policy_rejected_before_execution(&response, &target)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn matches_quoted_leading_space_argument_and_ordinary_marker_exactly() -> TestResult {
+    let server = ServerFixture::start_with_rules(
+        &["/usr/bin/printf %s marker", "/usr/bin/printf %s ' marker'"],
+        1,
+    )?;
+    let ordinary = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/usr/bin/printf %s marker"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    let quoted_space = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/usr/bin/printf %s ' marker'"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    for (response, expected_stdout) in [(&ordinary, "marker"), (&quoted_space, " marker")] {
+        assert_eq!(response.status, 200);
+        let message = response.mcp_message()?;
+        assert_eq!(
+            message.pointer("/result/isError").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            message
+                .pointer("/result/structuredContent/stdout")
+                .and_then(Value::as_str),
+            Some(expected_stdout)
+        );
+        assert_eq!(
+            message
+                .pointer("/result/structuredContent/exit_code")
+                .and_then(Value::as_i64),
+            Some(0)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_unquoted_backslash_newline_and_accepts_quoted_abcd() -> TestResult {
+    let server = ServerFixture::start_with_rules(
+        &["/usr/bin/printf %s ab cd", "/usr/bin/printf %s abcd"],
+        1,
+    )?;
+    let target_name = "unquoted continuation side effect.txt";
+    let target = server.directory.path.join(target_name);
+    let unquoted = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({
+            "command": format!("/usr/bin/printf %s ab\\\ncd > '{target_name}'")
+        })),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_policy_rejected_before_execution(&unquoted, &target)?;
+
+    let quoted = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({
+            "command": "/usr/bin/printf %s \"ab\\\ncd\""
+        })),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_eq!(quoted.status, 200);
+    let message = quoted.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some("abcd")
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
     );
     Ok(())
 }

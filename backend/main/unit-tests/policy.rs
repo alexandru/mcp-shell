@@ -24,6 +24,16 @@ fn is_rejected(command: &str, allow_rules: &[&str]) -> Result<bool, Box<dyn std:
     Ok(authorize(command, &rules(allow_rules)?).is_err())
 }
 
+fn has_unsupported_syntax(
+    command: &str,
+    allow_rules: &[&str],
+) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(matches!(
+        authorize(command, &rules(allow_rules)?),
+        Err(PolicyError::UnsupportedShellSyntax)
+    ))
+}
+
 #[test]
 fn denies_commands_when_no_rules_are_configured() {
     assert!(matches!(
@@ -76,6 +86,11 @@ fn checks_every_command_in_semicolon_and_newline_lists() -> Result<(), Box<dyn s
     let authorized = expression(command, &["gh *", "head *"])?;
 
     assert_eq!(authorized.script(), command);
+    let whitespace_command = "gh\tpr\tview\t1\nhead\t10";
+    assert_eq!(
+        expression(whitespace_command, &["gh *", "head *"])?.script(),
+        whitespace_command
+    );
     Ok(())
 }
 
@@ -109,6 +124,61 @@ fn allows_escaped_unquoted_metacharacters_as_literals() -> Result<(), Box<dyn st
     let authorized = expression(command, &["/bin/echo literal|value $HOME"])?;
 
     assert_eq!(authorized.script(), command);
+    Ok(())
+}
+
+#[test]
+fn rejects_uncovered_bytes_with_wildcard_and_exact_rules() -> Result<(), Box<dyn std::error::Error>>
+{
+    let commands = [
+        r"/usr/bin/printf %s \ marker",
+        "/usr/bin/printf %s \rmarker",
+        "/usr/bin/printf %s \u{000b}marker",
+        "/usr/bin/printf %s \u{000c}marker",
+    ];
+    for command in commands {
+        for rule in ["/usr/bin/printf *", "/usr/bin/printf %s marker"] {
+            assert!(has_unsupported_syntax(command, &[rule])?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_unquoted_line_continuations_with_wildcard_and_exact_rules()
+-> Result<(), Box<dyn std::error::Error>> {
+    let command = "/usr/bin/printf %s ab\\\ncd";
+
+    assert!(has_unsupported_syntax(command, &["/usr/bin/printf *"])?);
+    assert!(is_not_allowed(command, &["/usr/bin/printf %s abcd"])?);
+    assert!(has_unsupported_syntax(
+        command,
+        &["/usr/bin/printf %s ab cd"]
+    )?);
+    Ok(())
+}
+
+#[test]
+fn allows_quoted_leading_whitespace_and_control_characters()
+-> Result<(), Box<dyn std::error::Error>> {
+    for character in [' ', '\t', '\n', '\r', '\u{000b}', '\u{000c}'] {
+        let command = format!("/usr/bin/printf %s '{character}marker'");
+
+        assert_eq!(
+            expression(&command, &["/usr/bin/printf *"])?.script(),
+            command
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn allows_double_quoted_line_continuation_as_one_literal_argument()
+-> Result<(), Box<dyn std::error::Error>> {
+    let command = "/usr/bin/printf %s \"ab\\\ncd\"";
+    let rule = "/usr/bin/printf %s abcd";
+
+    assert_eq!(expression(command, &[rule])?.script(), command);
     Ok(())
 }
 
