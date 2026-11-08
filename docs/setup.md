@@ -18,7 +18,7 @@ install -m 0755 target/release/mcp-shell "$HOME/.local/bin/mcp-shell"
 ```
 
 Install Bash and any CLI tools used by your allow rules. Use the vendors' current
-installation instructions for [GitHub CLI](https://cli.github.com/manual/installation)
+installation instructions for [GitHub CLI](https://github.com/cli/cli#installation)
 and [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli).
 Confirm that each executable is available in the server's `PATH`.
 
