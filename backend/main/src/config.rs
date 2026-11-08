@@ -396,7 +396,9 @@ pub enum ConfigError {
     CurrentDirectory(#[source] std::io::Error),
 }
 
-const DEFAULT_BIND_PORT: u16 = 8090;
+type HttpPort = u16;
+
+const DEFAULT_BIND_PORT: HttpPort = 8090;
 const DEFAULT_RUNTIME: RuntimeLimit = RuntimeLimit(Duration::from_secs(60));
 const MAX_RUNTIME: Duration = Duration::from_secs(24 * 60 * 60);
 const TOKEN_HASH_ENV: &str = "MCP_SHELL_TOKEN_SHA256";
