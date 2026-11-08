@@ -32,6 +32,7 @@ max_concurrent = {max_concurrent}
 static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(0);
 
+type HttpStatusCode = u16;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 struct TestDirectory {
@@ -261,7 +262,7 @@ impl ServerFixture {
         let status_text = String::from_utf8(output.stdout).map_err(io::Error::other)?;
         let status = status_text
             .trim()
-            .parse::<u16>()
+            .parse::<HttpStatusCode>()
             .map_err(io::Error::other)?;
         let body = fs::read_to_string(&response_path)?;
         fs::remove_file(response_path)?;
@@ -294,7 +295,7 @@ impl Drop for ServerFixture {
 }
 
 struct HttpResponse {
-    status: u16,
+    status: HttpStatusCode,
     body: String,
 }
 
@@ -595,6 +596,41 @@ fn lists_execute_tool_and_returns_stdout_stderr_and_exit_code() -> TestResult {
             .pointer("/result/isError")
             .and_then(Value::as_bool),
         Some(false)
+    );
+    Ok(())
+}
+
+#[test]
+fn executes_quoted_shell_metacharacters_as_literal_argument_text() -> TestResult {
+    let server = ServerFixture::start_with_rules(&["/bin/echo *"], 1)?;
+    let response = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({
+            "command": "/bin/echo 'literal | [value] $HOME'"
+        })),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    assert_eq!(response.status, 200);
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some("literal | [value] $HOME\n")
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
     );
     Ok(())
 }

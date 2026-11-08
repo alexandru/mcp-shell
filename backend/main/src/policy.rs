@@ -69,30 +69,51 @@ pub(crate) fn authorize(
     })
 }
 
+#[derive(Clone, Copy)]
+enum CommandSyntaxState {
+    Unquoted,
+    SingleQuoted,
+    DoubleQuoted,
+    EscapedUnquoted,
+    EscapedDoubleQuoted,
+}
+
 fn contains_unsupported_shell_syntax(command: &str) -> bool {
-    command.chars().any(|character| {
-        matches!(
-            character,
-            '\0' | '\n'
-                | '\r'
-                | '|'
-                | ';'
-                | '&'
-                | '<'
-                | '>'
-                | '$'
-                | '`'
-                | '('
-                | ')'
-                | '{'
-                | '}'
-                | '*'
-                | '?'
-                | '['
-                | ']'
-                | '~'
-        )
-    })
+    let mut state = CommandSyntaxState::Unquoted;
+
+    for character in command.chars() {
+        if character == '\0' {
+            return true;
+        }
+
+        state = match state {
+            CommandSyntaxState::Unquoted => match character {
+                '\\' => CommandSyntaxState::EscapedUnquoted,
+                '\'' => CommandSyntaxState::SingleQuoted,
+                '"' => CommandSyntaxState::DoubleQuoted,
+                '|' | ';' | '&' | '<' | '>' | '$' | '`' | '(' | ')' | '{' | '}' | '*' | '?'
+                | '[' | ']' | '~' | '\n' | '\r' => return true,
+                _ => CommandSyntaxState::Unquoted,
+            },
+            CommandSyntaxState::SingleQuoted => {
+                if character == '\'' {
+                    CommandSyntaxState::Unquoted
+                } else {
+                    CommandSyntaxState::SingleQuoted
+                }
+            }
+            CommandSyntaxState::DoubleQuoted => match character {
+                '\\' => CommandSyntaxState::EscapedDoubleQuoted,
+                '"' => CommandSyntaxState::Unquoted,
+                '$' | '`' => return true,
+                _ => CommandSyntaxState::DoubleQuoted,
+            },
+            CommandSyntaxState::EscapedUnquoted => CommandSyntaxState::Unquoted,
+            CommandSyntaxState::EscapedDoubleQuoted => CommandSyntaxState::DoubleQuoted,
+        };
+    }
+
+    false
 }
 
 fn rule_matches(pattern: &str, invocation: &str) -> bool {

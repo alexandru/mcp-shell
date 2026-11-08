@@ -51,6 +51,77 @@ fn allows_quote_decoded_literal_arguments() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
+fn allows_quoted_literal_shell_metacharacters() -> Result<(), Box<dyn std::error::Error>> {
+    let single_quoted = invocation("/bin/echo 'literal|[value]'", &["/bin/echo *"])?;
+    let double_quoted = invocation("/bin/echo \"literal|[value]\"", &["/bin/echo *"])?;
+    let jq_expression = invocation("gh --jq '.[].labels[].name'", &["gh --jq*"])?;
+
+    assert_eq!(single_quoted.arguments(), double_quoted.arguments());
+    assert_eq!(
+        single_quoted
+            .arguments()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["literal|[value]"]
+    );
+    assert_eq!(
+        jq_expression
+            .arguments()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["--jq", ".[].labels[].name"]
+    );
+    Ok(())
+}
+
+#[test]
+fn allows_single_quoted_expansion_text_as_a_literal() -> Result<(), Box<dyn std::error::Error>> {
+    let authorized = invocation("/bin/echo '$HOME $(whoami) `date`'", &["/bin/echo *"])?;
+
+    assert_eq!(
+        authorized
+            .arguments()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["$HOME $(whoami) `date`"]
+    );
+    Ok(())
+}
+
+#[test]
+fn allows_escaped_unquoted_operators_as_literals() -> Result<(), Box<dyn std::error::Error>> {
+    let authorized = invocation(r"/bin/echo literal\|value \$HOME", &["/bin/echo *"])?;
+
+    assert_eq!(
+        authorized
+            .arguments()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["literal|value", "$HOME"]
+    );
+    Ok(())
+}
+
+#[test]
+fn allows_literal_newlines_inside_double_quotes() -> Result<(), Box<dyn std::error::Error>> {
+    let authorized = invocation("/bin/echo \"first\nsecond\"", &["/bin/echo *"])?;
+
+    assert_eq!(
+        authorized
+            .arguments()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["first\nsecond"]
+    );
+    Ok(())
+}
+
+#[test]
 fn keeps_argument_boundaries_when_matching_exact_rules() -> Result<(), Box<dyn std::error::Error>> {
     let authorized = invocation("/usr/bin/printf %s marker", &["/usr/bin/printf %s marker"])?;
 
@@ -195,7 +266,7 @@ fn allows_literal_dots_in_paths_and_arguments() -> Result<(), Box<dyn std::error
 }
 
 #[test]
-fn rejects_shell_metacharacters_and_expansion_syntax() {
+fn rejects_unquoted_shell_metacharacters_and_expansion_syntax() {
     for command in [
         "gh pr | cat",
         "gh pr; cat",
@@ -204,6 +275,9 @@ fn rejects_shell_metacharacters_and_expansion_syntax() {
         "gh pr > output",
         "gh pr $HOME",
         "gh pr `whoami`",
+        "gh pr \"$HOME\"",
+        "gh pr \"$(whoami)\"",
+        "gh pr \"`whoami`\"",
         "gh pr (view)",
         "gh pr {view}",
         "gh *",
