@@ -132,9 +132,15 @@ that container. Keep the certificate authority's private key on the host. Never
 disable certificate verification.
 
 For local HTTPS, a Caddy site can use its internal CA and proxy to the loopback
-server:
+server. These options avoid a redirect listener on privileged port 80 and leave
+trust installation explicit in the client:
 
 ```caddyfile
+{
+    auto_https disable_redirects
+    skip_install_trust
+}
+
 https://host.docker.internal:8443 {
     tls internal
     reverse_proxy 127.0.0.1:8090
