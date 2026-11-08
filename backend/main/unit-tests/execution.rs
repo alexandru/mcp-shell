@@ -29,6 +29,8 @@ static TEMP_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
 const PIPELINE: &str = "/bin/sleep 60 | /bin/cat";
 const CONTROL_COMMAND: &str = "/usr/bin/printf marker";
+const OUTPUT_LIMIT_CONTROL_COMMAND: &str = "/usr/bin/printf recovered";
+const OUTPUT_LIMIT_REPETITIONS: RepetitionCount = 32;
 const MAX_START_WAIT: Duration = Duration::from_secs(10);
 const MAX_STOP_WAIT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -37,6 +39,7 @@ const MIN_LIVE_PIPELINE_MEMBERS: ProcessCount = 3;
 type ProcessId = i32;
 type ProcessGroupId = i32;
 type ProcessCount = usize;
+type RepetitionCount = usize;
 
 struct TempDirectory(PathBuf);
 
@@ -120,6 +123,119 @@ async fn run_future_abort_case() -> Result<(), Box<dyn Error>> {
         exercise_abort_and_reuse(&executor, expression, control_expression, &pid_marker).await;
     executor.shutdown().await;
     result
+}
+
+#[test]
+fn output_limit_races_stop_and_reuse_capacity_repeatedly() -> Result<(), Box<dyn Error>> {
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(run_output_limit_race_case())
+}
+
+async fn run_output_limit_race_case() -> Result<(), Box<dyn Error>> {
+    let fixture = TempDirectory::new()?;
+    let working_directory = fixture.path().join("working directory");
+    fs::create_dir(&working_directory)?;
+    let pid_marker = working_directory.join("bash pid marker.txt");
+    let initialization_file = fixture.path().join("trusted output init.bash");
+    fs::write(
+        &initialization_file,
+        format!(
+            "builtin printf '%s\\n' \"$$\" >> {}\n",
+            shell_literal(&pid_marker)?
+        ),
+    )?;
+
+    let initialization_file = initialization_file
+        .to_str()
+        .ok_or_else(|| test_error("initialization file path is not valid UTF-8"))?;
+    let working_directory = working_directory
+        .to_str()
+        .ok_or_else(|| test_error("working directory path is not valid UTF-8"))?;
+    let document = format!(
+        "initialization_file = {}\nworking_directory = {}\nallow_rules = [\"/usr/bin/yes *\", \"/usr/bin/printf *\"]\nmax_runtime_ms = 5000\nmax_output_bytes = 128\nmax_concurrent = 1\n",
+        toml::Value::String(initialization_file.to_owned()),
+        toml::Value::String(working_directory.to_owned()),
+    );
+    let config = Arc::new(Config::parse(&document, &"00".repeat(32))?);
+    let executor = Executor::new(config.clone(), CancellationToken::new());
+    let result = exercise_output_limit_races(&executor, &config, &pid_marker).await;
+    executor.shutdown().await;
+    result
+}
+
+async fn exercise_output_limit_races(
+    executor: &Executor,
+    config: &Config,
+    pid_marker: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let overflow_commands = [
+        "/usr/bin/yes x",
+        "/usr/bin/yes x 1>&2",
+        "/usr/bin/printf '%080d' 0; /usr/bin/printf '%080d' 0 1>&2",
+    ];
+
+    for iteration in 0..OUTPUT_LIMIT_REPETITIONS {
+        for command in overflow_commands {
+            let expression = authorize(command, &config.allow_rules)?;
+            let result = executor
+                .execute(expression, CancellationToken::new(), None)
+                .await;
+            let process_group = latest_process_group(pid_marker)?;
+            let mut process_cleanup = ProcessGroupCleanup::new(process_group);
+
+            match result {
+                Err(crate::execution::ExecutionError::OutputLimit) => (),
+                Err(error) => {
+                    return Err(test_error(format!(
+                        "output-limit case {iteration}, command {command:?}: unexpected execution error {error:?}"
+                    )));
+                }
+                Ok(_) => {
+                    return Err(test_error(format!(
+                        "output-limit case {iteration}, command {command:?}: expected OutputLimit but execution returned output"
+                    )));
+                }
+            }
+
+            wait_for_group_disappearance(process_group).await?;
+            process_cleanup.disarm();
+
+            let recovery_expression = authorize(OUTPUT_LIMIT_CONTROL_COMMAND, &config.allow_rules)?;
+            let recovered = executor
+                .execute(recovery_expression, CancellationToken::new(), None)
+                .await;
+            match recovered {
+                Ok(output) if output.succeeded() && output.stdout == "recovered" => (),
+                Ok(_) => {
+                    return Err(test_error(format!(
+                        "output-limit case {iteration}, command {command:?}: recovery command {OUTPUT_LIMIT_CONTROL_COMMAND:?} returned an unexpected result"
+                    )));
+                }
+                Err(error) => {
+                    return Err(test_error(format!(
+                        "output-limit case {iteration}, command {command:?}: recovery command {OUTPUT_LIMIT_CONTROL_COMMAND:?} failed with {error:?}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn latest_process_group(pid_marker: &Path) -> Result<ProcessGroupId, Box<dyn Error>> {
+    let contents = fs::read_to_string(pid_marker)?;
+    let process_id = contents
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .ok_or_else(|| test_error("trusted initialization did not write a process marker"))?
+        .trim()
+        .parse::<ProcessGroupId>()?;
+    if process_id <= 0 {
+        return Err(test_error(
+            "trusted initialization wrote a nonpositive process marker",
+        ));
+    }
+    Ok(process_id)
 }
 
 async fn exercise_abort_and_reuse(

@@ -2191,7 +2191,8 @@ report_env() { printf '%s|%s|%s\n' "$HOME" "$PATH" "$MCP_TEST_AUTH"; }
             .and_then(Value::as_bool),
         Some(false)
     );
-    let expected_working_directory = server.directory.path.join("working directory with spaces");
+    let expected_working_directory =
+        fs::canonicalize(server.directory.path.join("working directory with spaces"))?;
     let expected_working_directory = expected_working_directory.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,

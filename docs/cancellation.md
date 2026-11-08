@@ -14,6 +14,10 @@ supervisor.
 The supervisor sends `SIGKILL` to the command's process group, then waits for the
 direct child. If process-group signaling fails, it attempts to kill the direct child
 before waiting. A drop fallback also attempts to signal the process group.
+On macOS, a group containing only zombies can report `EPERM`
+([Apple XNU implementation](https://github.com/apple-oss-distributions/xnu/blob/f6217f8/bsd/kern/kern_sig.c#L1702-L1718)); after reaping the
+direct child, the supervisor retries that signal. A missing group counts as stopped;
+a persistent permission error remains an error.
 Cancellation stops the owned processes, but it does not undo completed local file
 writes or remote mutations.
 
