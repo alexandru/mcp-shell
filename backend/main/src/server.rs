@@ -26,7 +26,11 @@ use thiserror::Error;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
-use crate::{config::Config, execution::Executor, policy};
+use crate::{
+    config::{Config, RuntimeLimit},
+    execution::Executor,
+    policy,
+};
 
 pub(crate) async fn serve(config: Config) -> Result<(), ServerError> {
     let mut interrupt = signal(SignalKind::interrupt()).map_err(ServerError::Signal)?;
@@ -100,7 +104,15 @@ impl ServerHandler for CommandServer {
         schema.insert("type".into(), json!("object"));
         schema.insert(
             "properties".into(),
-            json!({"command": {"type": "string", "minLength": 1}}),
+            json!({
+                "command": {"type": "string", "minLength": 1},
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 86_400_000,
+                    "description": "Optional runtime in milliseconds (at most 24 hours), capped by the configured server limit."
+                }
+            }),
         );
         schema.insert("required".into(), json!(["command"]));
         schema.insert("additionalProperties".into(), json!(false));
@@ -122,8 +134,10 @@ impl ServerHandler for CommandServer {
         let arguments = request
             .arguments
             .ok_or_else(|| McpError::invalid_params("expected command argument", None))?;
-        let params: ExecuteParams = serde_json::from_value(Value::Object(arguments))
-            .map_err(|_| McpError::invalid_params("expected only a command string", None))?;
+        let params: ExecuteParams =
+            serde_json::from_value(Value::Object(arguments)).map_err(|_| {
+                McpError::invalid_params("expected command and optional valid timeout_ms", None)
+            })?;
         let expression = match policy::authorize(&params.command, &self.config.allow_rules) {
             Ok(expression) => expression,
             Err(error) => return Ok(tool_error(&error.to_string())),
@@ -140,7 +154,11 @@ impl ServerHandler for CommandServer {
                     McpError::internal_error("could not start execution response", None)
                 })?;
         }
-        match self.executor.execute(expression, context.ct).await {
+        match self
+            .executor
+            .execute(expression, context.ct, params.timeout_ms)
+            .await
+        {
             Ok(output) => {
                 let succeeded = output.succeeded();
                 let result = serde_json::to_value(output).map_err(|_| {
@@ -164,6 +182,7 @@ type CommandText = String;
 #[serde(deny_unknown_fields)]
 struct ExecuteParams {
     command: CommandText,
+    timeout_ms: Option<RuntimeLimit>,
 }
 
 struct RequestLimit(usize);

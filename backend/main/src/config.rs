@@ -36,10 +36,18 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let token_hash = env::var(TOKEN_HASH_ENV).map_err(|_| ConfigError::MissingTokenHash)?;
-        let token_hash = TokenHash::parse(&token_hash)?;
+        let token_verifier = env::var(TOKEN_HASH_ENV).map_err(|_| ConfigError::MissingTokenHash)?;
 
-        Self::from_toml(&document, token_hash)
+        Self::parse(&document, &token_verifier)
+    }
+
+    /// Parses TOML configuration and a SHA-256 bearer-token verifier.
+    ///
+    /// # Errors
+    /// Returns an error if the verifier, TOML, or any configured value is invalid.
+    pub(crate) fn parse(document: &str, token_verifier: &str) -> Result<Self, ConfigError> {
+        let token_hash = TokenHash::parse(token_verifier)?;
+        Self::from_toml(document, token_hash)
     }
 
     fn from_toml(document: &str, token_hash: TokenHash) -> Result<Self, ConfigError> {
@@ -198,11 +206,15 @@ impl AllowRule {
 }
 
 /// A positive maximum duration for one execution request.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RuntimeLimit(Duration);
 
 impl RuntimeLimit {
-    fn from_millis(milliseconds: u64) -> Result<Self, ConfigError> {
+    /// Creates a validated runtime limit from milliseconds.
+    ///
+    /// # Errors
+    /// Returns an error unless the duration is between one millisecond and 24 hours.
+    pub(crate) fn from_millis(milliseconds: u64) -> Result<Self, ConfigError> {
         let duration = Duration::from_millis(milliseconds);
         if duration.is_zero() {
             return Err(ConfigError::InvalidValue {
@@ -222,6 +234,16 @@ impl RuntimeLimit {
     /// Returns the maximum execution duration.
     pub const fn duration(self) -> Duration {
         self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RuntimeLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let milliseconds = u64::deserialize(deserializer)?;
+        Self::from_millis(milliseconds).map_err(serde::de::Error::custom)
     }
 }
 

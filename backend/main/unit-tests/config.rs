@@ -35,13 +35,16 @@ impl Drop for TempDirectory {
     }
 }
 
-fn token_hash() -> Result<TokenHash, ConfigError> {
+fn token_verifier() -> String {
     let digest = Sha256::digest(b"test bearer token");
-    let value = digest
+    digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    TokenHash::parse(&value)
+        .collect::<String>()
+}
+
+fn token_hash() -> Result<TokenHash, ConfigError> {
+    TokenHash::parse(&token_verifier())
 }
 
 #[test]
@@ -71,6 +74,20 @@ fn defaults_bind_to_loopback_and_deny_every_command() -> Result<(), Box<dyn std:
         config.working_directory.path(),
         std::env::current_dir()?.as_path()
     );
+    Ok(())
+}
+
+#[test]
+fn parses_toml_and_token_verifier_together() -> Result<(), Box<dyn std::error::Error>> {
+    let verifier = token_verifier();
+    let config = Config::parse("allow_rules = [\"gh *\"]", &verifier)?;
+
+    assert!(config.token_hash.verify(b"test bearer token"));
+    assert!(crate::policy::authorize("gh pr view 123", &config.allow_rules).is_ok());
+    assert!(matches!(
+        Config::parse("", "00"),
+        Err(ConfigError::InvalidTokenHash)
+    ));
     Ok(())
 }
 
@@ -232,6 +249,20 @@ fn accepts_configured_runtime_through_twenty_four_hours() -> Result<(), Box<dyn 
             ..
         })
     ));
+    Ok(())
+}
+
+#[test]
+fn deserializes_runtime_limits_through_the_validated_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let minimum = serde_json::from_str::<RuntimeLimit>("1")?;
+    let maximum = serde_json::from_str::<RuntimeLimit>("86400000")?;
+
+    assert_eq!(minimum.duration(), std::time::Duration::from_millis(1));
+    assert_eq!(maximum.duration(), std::time::Duration::from_secs(86_400));
+    for value in ["0", "-1", "1.5", "86400001"] {
+        assert!(serde_json::from_str::<RuntimeLimit>(value).is_err());
+    }
     Ok(())
 }
 
