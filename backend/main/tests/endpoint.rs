@@ -22,7 +22,8 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const CURL_TIMEOUT_SECONDS: &str = "5";
 const CONFIG: &str = r#"
 bind = "127.0.0.1:{port}"
-allowed_hosts = ["127.0.0.1:{port}"]
+allowed_hosts = {allowed_hosts}
+allowed_origins = {allowed_origins}
 allow_rules = {allow_rules}
 max_runtime_ms = 5000
 max_output_bytes = 1048576
@@ -30,6 +31,7 @@ max_concurrent = {max_concurrent}
 {optional_config}
 "#;
 const DEFAULT_ALLOW_RULES: &[&str] = &["/usr/bin/printf *", "/bin/echo *", "/usr/bin/false *"];
+const DEFAULT_ALLOWED_HOSTS: &[&str] = &["127.0.0.1"];
 const DEFAULT_MAX_CONCURRENT: ExecutionConcurrency = 4;
 
 static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -59,6 +61,8 @@ struct TestEnvironment<'a> {
 
 #[derive(Default)]
 struct ServerOptions<'a> {
+    allowed_hosts: Option<&'a [&'a str]>,
+    allowed_origins: &'a [&'a str],
     allow_rules: Option<&'a [&'a str]>,
     max_concurrent: Option<ExecutionConcurrency>,
     initialization_file: Option<FixtureFile<'a>>,
@@ -195,6 +199,13 @@ impl ServerFixture {
         let port = reservation.local_addr()?.port();
         drop(reservation);
         let config_path = directory.path.join("server.toml");
+        let allowed_hosts = options.allowed_hosts.unwrap_or(DEFAULT_ALLOWED_HOSTS);
+        let allowed_hosts = allowed_hosts
+            .iter()
+            .map(|host| format!("{host}:{port}"))
+            .collect::<Vec<_>>();
+        let allowed_hosts = serde_json::to_string(&allowed_hosts)?;
+        let allowed_origins = serde_json::to_string(options.allowed_origins)?;
         let allow_rules =
             serde_json::to_string(options.allow_rules.unwrap_or(DEFAULT_ALLOW_RULES))?;
         let max_concurrent = options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
@@ -207,6 +218,8 @@ impl ServerFixture {
         }
         let config = CONFIG
             .replace("{port}", &port.to_string())
+            .replace("{allowed_hosts}", &allowed_hosts)
+            .replace("{allowed_origins}", &allowed_origins)
             .replace("{allow_rules}", &allow_rules)
             .replace("{max_concurrent}", &max_concurrent.to_string())
             .replace("{optional_config}", &optional_config);
@@ -605,6 +618,72 @@ fn rejects_untrusted_host_and_present_untrusted_origin() -> TestResult {
 
     assert_eq!(invalid_host.status, 403);
     assert_eq!(invalid_origin.status, 403);
+    Ok(())
+}
+
+#[test]
+fn accepts_configured_hosts_and_origin_and_rejects_unconfigured_values() -> TestResult {
+    let server = ServerFixture::start_with_options(ServerOptions {
+        allowed_hosts: Some(&["host.docker.internal", "mcp.example.test"]),
+        allowed_origins: &["https://mcp.example.test"],
+        allow_rules: Some(&["/bin/echo *"]),
+        ..ServerOptions::default()
+    })?;
+
+    for (host, command, expected_stdout) in [
+        (
+            "host.docker.internal",
+            "/bin/echo docker host",
+            "docker host\n",
+        ),
+        ("mcp.example.test", "/bin/echo proxy host", "proxy host\n"),
+    ] {
+        let response = server.post(
+            "tools/call",
+            Some("execute"),
+            &tool_call_body(json!({"command": command})),
+            Some(TOKEN),
+            host,
+            None,
+        )?;
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response
+                .mcp_message()?
+                .pointer("/result/structuredContent/stdout")
+                .and_then(Value::as_str),
+            Some(expected_stdout)
+        );
+    }
+
+    let configured_origin = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/bin/echo configured origin"})),
+        Some(TOKEN),
+        "mcp.example.test",
+        Some("https://mcp.example.test"),
+    )?;
+    let unconfigured_host = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/bin/echo rejected host"})),
+        Some(TOKEN),
+        "attacker.invalid",
+        None,
+    )?;
+    let unconfigured_origin = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/bin/echo rejected origin"})),
+        Some(TOKEN),
+        "mcp.example.test",
+        Some("https://attacker.invalid"),
+    )?;
+
+    assert_eq!(configured_origin.status, 200);
+    assert_eq!(unconfigured_host.status, 403);
+    assert_eq!(unconfigured_origin.status, 403);
     Ok(())
 }
 
