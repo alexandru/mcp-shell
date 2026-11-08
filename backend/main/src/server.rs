@@ -51,6 +51,9 @@ pub(crate) async fn serve(config: Config) -> Result<(), ServerError> {
         move || Ok(handler.clone()),
         Arc::new(NeverSessionManager::default()),
         StreamableHttpServerConfig::default()
+            .with_allowed_hosts(config.allowed_hosts.iter().map(|host| host.as_str()))
+            .with_allowed_origins(config.allowed_origins.iter().map(|origin| origin.as_str()))
+            .enforce_origin_validation()
             .with_legacy_session_mode(false)
             .with_stateless_protocol_metadata_required(true)
             .with_sse_keep_alive(Some(std::time::Duration::from_secs(1)))
