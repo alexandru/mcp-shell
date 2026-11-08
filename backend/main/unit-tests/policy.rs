@@ -258,6 +258,32 @@ fn rejects_bare_time_and_coproc_reserved_prefixes() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn rejects_bare_bash_reserved_words_after_an_allowed_command()
+-> Result<(), Box<dyn std::error::Error>> {
+    for keyword in [
+        "!", "[[", "]]", "{", "}", "case", "coproc", "do", "done", "elif", "else", "esac", "fi",
+        "for", "function", "if", "in", "select", "then", "time", "until", "while",
+    ] {
+        let command = format!("/usr/bin/printf %s marker\n{keyword}");
+        let exact_rules = ["/usr/bin/printf %s marker", keyword];
+        let wildcard_rule = format!("{keyword} *");
+        let wildcard_rules = ["/usr/bin/printf *", wildcard_rule.as_str()];
+
+        assert!(is_rejected(&command, &exact_rules)?);
+        assert!(is_rejected(&command, &wildcard_rules)?);
+    }
+    Ok(())
+}
+
+#[test]
+fn allows_reserved_spellings_as_ordinary_argument_text() -> Result<(), Box<dyn std::error::Error>> {
+    let command = "/bin/echo then else fi do done esac in time";
+
+    assert_eq!(expression(command, &[command])?.script(), command);
+    Ok(())
+}
+
+#[test]
 fn allows_quoted_escaped_and_concatenated_keyword_names_as_commands()
 -> Result<(), Box<dyn std::error::Error>> {
     for (command, rule) in [
@@ -284,6 +310,18 @@ fn allows_quoted_escaped_and_concatenated_keyword_names_as_commands()
         (
             "co\"proc\" /usr/bin/printf %s marker",
             "coproc /usr/bin/printf %s marker",
+        ),
+        (
+            "'then' /usr/bin/printf %s marker",
+            "then /usr/bin/printf %s marker",
+        ),
+        (
+            r"\else /usr/bin/printf %s marker",
+            "else /usr/bin/printf %s marker",
+        ),
+        (
+            "es\"ac\" /usr/bin/printf %s marker",
+            "esac /usr/bin/printf %s marker",
         ),
     ] {
         assert_eq!(expression(command, &[rule])?.script(), command);

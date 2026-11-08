@@ -16,7 +16,7 @@ Unquoted spaces and tabs separate words; newlines separate commands. Quote argum
 
 The server rejects syntax errors and unsupported or unknown constructs. Client expressions cannot contain function-definition syntax, use loops, conditionals, subshells or background commands, or use heredocs, here-strings, variable assignments, or variable, command, process, arithmetic, tilde, glob, or brace expansion. Quoting does not make an expansion literal: for example, `"$HOME"` is still an expansion and is rejected.
 
-The unquoted reserved syntax prefixes `time` and `coproc` are unsupported. Quoted or escaped executable names, and explicit external paths such as `/usr/bin/time`, remain ordinary invocations subject to the allow rules.
+The server rejects bare Bash reserved words in executable position: `!`, `[[`, `]]`, `{`, `}`, `case`, `coproc`, `do`, `done`, `elif`, `else`, `esac`, `fi`, `for`, `function`, `if`, `in`, `select`, `then`, `time`, `until`, and `while` ([GNU Bash reserved words](https://www.gnu.org/software/bash/manual/html_node/Reserved-Words.html)). These words remain ordinary argument text. Quoted or escaped executable spellings, and explicit external paths such as `/usr/bin/time`, remain ordinary invocations subject to the allow rules.
 
 ## Allow rules
 

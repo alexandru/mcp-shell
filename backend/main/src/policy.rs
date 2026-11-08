@@ -184,7 +184,7 @@ fn authorize_command(
     if executable.is_empty() {
         return Err(PolicyError::InvalidExecutable);
     }
-    if is_unquoted_reserved_prefix(name, source, &executable)? {
+    if is_unquoted_reserved_word(name, source, &executable)? {
         return Err(PolicyError::UnsupportedShellSyntax);
     }
     let mut words = vec![executable];
@@ -213,12 +213,35 @@ fn authorize_command(
     }
 }
 
-fn is_unquoted_reserved_prefix(
+fn is_unquoted_reserved_word(
     node: Node<'_>,
     source: &str,
     executable: &str,
 ) -> Result<bool, PolicyError> {
-    if !matches!(executable, "time" | "coproc") {
+    if !matches!(
+        executable,
+        "!" | "[["
+            | "]]"
+            | "{"
+            | "}"
+            | "case"
+            | "coproc"
+            | "do"
+            | "done"
+            | "elif"
+            | "else"
+            | "esac"
+            | "fi"
+            | "for"
+            | "function"
+            | "if"
+            | "in"
+            | "select"
+            | "then"
+            | "time"
+            | "until"
+            | "while"
+    ) {
         return Ok(false);
     }
     let raw = node_text(node, source)?;
