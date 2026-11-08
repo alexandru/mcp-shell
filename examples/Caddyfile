@@ -1,0 +1,5 @@
+# Replace the example name with a DNS name that resolves to this host.
+# Caddy preserves the incoming Host and URI for this HTTP upstream.
+mcp.example.com {
+	reverse_proxy 127.0.0.1:8090
+}

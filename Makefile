@@ -4,7 +4,7 @@ tests:
 	cd backend && cargo test --workspace --all-features --locked
 
 build:
-	cd backend && cargo build --locked --release --package backend --bin backend
+	cd backend && cargo build --locked --release --package backend --bin mcp-shell
 
 docker-build-local:
 	docker build -t backend ./backend

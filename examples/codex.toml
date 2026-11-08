@@ -1,0 +1,8 @@
+[mcp_servers.mcp-shell]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "MCP_SHELL_TOKEN"
+# Per-tool timeout in seconds; Codex defaults to 60 seconds.
+tool_timeout_sec = 75
+
+[features]
+mcp_2026_07_28 = true

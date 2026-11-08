@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.mcp-shell</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/REPLACE_ME/.local/bin/mcp-shell</string>
+    <string>--config</string>
+    <string>/Users/REPLACE_ME/.config/mcp-shell/server.toml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>MCP_SHELL_TOKEN_SHA256</key>
+    <string>REPLACE_WITH_SHA256_VERIFIER</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_ME/Library/Logs/mcp-shell/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_ME/Library/Logs/mcp-shell/stderr.log</string>
+</dict>
+</plist>

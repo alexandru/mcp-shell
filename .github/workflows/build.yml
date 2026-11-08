@@ -53,6 +53,61 @@ jobs:
         working-directory: backend
         run: cargo xtask check
 
+      - name: Check command-line and setup examples
+        run: |
+          set -euo pipefail
+          unset MCP_SHELL_TOKEN_SHA256
+
+          for flag in --help -h; do
+            help_output="$(cargo run --locked --quiet --manifest-path backend/Cargo.toml --package backend --bin mcp-shell -- "$flag")"
+            if [[ "$help_output" != *"Usage: mcp-shell --config <server.toml>"* ]]; then
+              printf 'unexpected help output for %s:\n%s\n' "$flag" "$help_output" >&2
+              exit 1
+            fi
+          done
+
+          for flag in --version -V; do
+            version_output="$(cargo run --locked --quiet --manifest-path backend/Cargo.toml --package backend --bin mcp-shell -- "$flag")"
+            case "$version_output" in
+              'mcp-shell '*) ;;
+              *)
+                printf 'unexpected version output for %s: %s\n' "$flag" "$version_output" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          argument_error_file="$RUNNER_TEMP/mcp-shell-arguments.txt"
+          if cargo run --locked --quiet --manifest-path backend/Cargo.toml --package backend --bin mcp-shell -- --unknown >"$argument_error_file" 2>&1; then
+            echo "an unknown argument unexpectedly succeeded" >&2
+            exit 1
+          fi
+          if ! grep -Fxq 'usage: mcp-shell --config <server.toml>' "$argument_error_file"; then
+            cat "$argument_error_file" >&2
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import ast
+          import plistlib
+          import tomllib
+          from pathlib import Path
+
+          for path in Path("scripts").rglob("*.py"):
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+          for path in (Path("examples/server.toml"), Path("examples/codex.toml")):
+              with path.open("rb") as file:
+                  tomllib.load(file)
+
+          with Path("examples/com.example.mcp-shell.plist").open("rb") as file:
+              plistlib.load(file)
+          PY
+
+          python3 scripts/auth-smoke.py --help >/dev/null
+          python3 -B -m unittest discover -s scripts/tests
+          bash -n examples/init.bash
+
   docker:
     name: docker (${{ matrix.platform }})
     needs: quality
@@ -172,9 +227,69 @@ jobs:
 
           echo "image smoke test passed"
 
+  native-artifacts:
+    name: native artifact (${{ matrix.platform }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            platform_name: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            platform_name: arm64
+            runner: ubuntu-24.04-arm
+          - platform: macos/arm64
+            platform_name: macos-arm64
+            runner: macos-26
+          - platform: macos/amd64
+            platform_name: macos-amd64
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Build release executable
+        working-directory: backend
+        run: cargo build --locked --release --package backend --bin mcp-shell
+
+      - name: Package executable and setup files
+        env:
+          PLATFORM_NAME: ${{ matrix.platform_name }}
+        run: |
+          set -euo pipefail
+
+          package_dir="$RUNNER_TEMP/mcp-shell-package"
+          archive_name="mcp-shell-${PLATFORM_NAME}.tar.gz"
+          mkdir -p "$package_dir"
+          cp backend/target/release/mcp-shell "$package_dir/mcp-shell"
+          cp -R README.md examples docs scripts "$package_dir/"
+          tar -czf "$RUNNER_TEMP/$archive_name" -C "$package_dir" mcp-shell README.md examples docs scripts
+          (cd "$RUNNER_TEMP" && shasum -a 256 "$archive_name" > "$archive_name.sha256")
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: mcp-shell-${{ matrix.platform_name }}
+          path: |
+            ${{ runner.temp }}/mcp-shell-${{ matrix.platform_name }}.tar.gz
+            ${{ runner.temp }}/mcp-shell-${{ matrix.platform_name }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+
   complete:
     name: build complete
-    needs: [quality, docker]
+    needs: [quality, docker, native-artifacts]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     steps:
@@ -182,8 +297,10 @@ jobs:
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           DOCKER_RESULT: ${{ needs.docker.result }}
+          NATIVE_ARTIFACTS_RESULT: ${{ needs.native-artifacts.result }}
         run: |
           set -euo pipefail
-          printf 'quality: %s\ndocker: %s\n' "$QUALITY_RESULT" "$DOCKER_RESULT"
+          printf 'quality: %s\ndocker: %s\nnative artifacts: %s\n' "$QUALITY_RESULT" "$DOCKER_RESULT" "$NATIVE_ARTIFACTS_RESULT"
           test "$QUALITY_RESULT" = success
           test "$DOCKER_RESULT" = success
+          test "$NATIVE_ARTIFACTS_RESULT" = success
