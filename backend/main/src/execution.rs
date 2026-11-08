@@ -1,5 +1,6 @@
 use std::{
     io,
+    os::unix::process::ExitStatusExt,
     process::{ExitStatus, Stdio},
     sync::{
         Arc,
@@ -80,15 +81,15 @@ impl Executor {
 pub(crate) struct ExecutionOutput {
     pub(crate) stdout: OutputText,
     pub(crate) stderr: OutputText,
-    pub(crate) exit_code: Option<ExitCode>,
+    #[serde(flatten)]
+    termination: Termination,
 }
 
-type ExitCode = i32;
 pub(crate) type OutputText = String;
 
 impl ExecutionOutput {
     pub(crate) fn succeeded(&self) -> bool {
-        self.exit_code == Some(0)
+        matches!(&self.termination, Termination::Exited { exit_code: 0 })
     }
 }
 
@@ -114,6 +115,28 @@ pub(crate) enum ExecutionError {
     ChildState,
     #[error("could not wait for command termination")]
     Wait(#[source] io::Error),
+}
+
+type ExitCode = i32;
+type SignalNumber = i32;
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Termination {
+    Exited { exit_code: ExitCode },
+    Signalled { signal: SignalNumber },
+}
+
+impl TryFrom<ExitStatus> for Termination {
+    type Error = ExecutionError;
+
+    fn try_from(status: ExitStatus) -> Result<Self, Self::Error> {
+        match (status.code(), status.signal()) {
+            (Some(exit_code), _) => Ok(Self::Exited { exit_code }),
+            (None, Some(signal)) => Ok(Self::Signalled { signal }),
+            (None, None) => Err(ExecutionError::ChildState),
+        }
+    }
 }
 
 struct ProcessGroup {
@@ -211,7 +234,7 @@ async fn run(
     match result {
         Ok((stdout, stderr, status)) => {
             group.identity = None;
-            Ok(output(stdout, stderr, status))
+            output(stdout, stderr, status)
         }
         Err(error) => {
             group.stop().await?;
@@ -247,10 +270,14 @@ async fn read_output(
     }
 }
 
-fn output(stdout: Vec<u8>, stderr: Vec<u8>, status: ExitStatus) -> ExecutionOutput {
-    ExecutionOutput {
+fn output(
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    status: ExitStatus,
+) -> Result<ExecutionOutput, ExecutionError> {
+    Ok(ExecutionOutput {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        exit_code: status.code(),
-    }
+        termination: Termination::try_from(status)?,
+    })
 }

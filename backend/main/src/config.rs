@@ -12,11 +12,6 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
-const DEFAULT_BIND_PORT: u16 = 8090;
-const DEFAULT_RUNTIME: RuntimeLimit = RuntimeLimit(Duration::from_secs(60));
-const MAX_RUNTIME: Duration = Duration::from_secs(24 * 60 * 60);
-const TOKEN_HASH_ENV: &str = "MCP_SHELL_TOKEN_SHA256";
-
 /// Validated configuration for the shell command server.
 pub struct Config {
     pub(crate) bind: BindAddress,
@@ -183,11 +178,21 @@ impl AllowRule {
                 reason: "must be nonempty and contain no NUL or newline characters",
             });
         }
-        Ok(Self(value.to_owned()))
+        let words = shlex::split(value).ok_or(ConfigError::InvalidValue {
+            field: "allow_rules",
+            reason: "must use valid shell quoting",
+        })?;
+        if words.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "allow_rules",
+                reason: "must contain at least one command word",
+            });
+        }
+        Ok(Self(words.join("\0")))
     }
 
-    /// Returns the configured wildcard pattern.
-    pub fn as_str(&self) -> &str {
+    /// Returns the compiled wildcard pattern.
+    pub(crate) fn compiled_pattern(&self) -> &str {
         &self.0
     }
 }
@@ -390,6 +395,11 @@ pub enum ConfigError {
     #[error("could not determine the current directory: {0}")]
     CurrentDirectory(#[source] std::io::Error),
 }
+
+const DEFAULT_BIND_PORT: u16 = 8090;
+const DEFAULT_RUNTIME: RuntimeLimit = RuntimeLimit(Duration::from_secs(60));
+const MAX_RUNTIME: Duration = Duration::from_secs(24 * 60 * 60);
+const TOKEN_HASH_ENV: &str = "MCP_SHELL_TOKEN_SHA256";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

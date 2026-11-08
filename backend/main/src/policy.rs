@@ -1,9 +1,6 @@
 use crate::config::AllowRule;
 use thiserror::Error;
 
-pub(crate) type ExecutableName = String;
-pub(crate) type ArgumentText = String;
-
 /// A literal executable and its arguments that passed the configured command policy.
 pub(crate) struct AuthorizedInvocation {
     program: ExecutableName,
@@ -50,7 +47,7 @@ pub(crate) fn authorize(
     }
 
     let words = shlex::split(command).ok_or(PolicyError::InvalidQuoting)?;
-    let normalized = words.join(" ");
+    let normalized = words.join("\0");
     let mut words = words.into_iter();
     let Some(program) = words.next() else {
         return Err(PolicyError::EmptyCommand);
@@ -61,7 +58,7 @@ pub(crate) fn authorize(
 
     if !rules
         .iter()
-        .any(|rule| rule_matches(rule.as_str(), &normalized))
+        .any(|rule| rule_matches(rule.compiled_pattern(), &normalized))
     {
         return Err(PolicyError::NotAllowed);
     }
@@ -101,7 +98,7 @@ fn contains_unsupported_shell_syntax(command: &str) -> bool {
 fn rule_matches(pattern: &str, invocation: &str) -> bool {
     wildcard_match(pattern, invocation)
         || pattern
-            .strip_suffix(" *")
+            .strip_suffix("\0*")
             .is_some_and(|prefix| prefix == invocation)
 }
 
@@ -144,6 +141,9 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 
     pattern_offset == pattern.len()
 }
+
+type ExecutableName = String;
+type ArgumentText = String;
 
 #[cfg(test)]
 #[path = "../unit-tests/policy.rs"]

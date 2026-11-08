@@ -49,11 +49,17 @@ fn defaults_bind_to_loopback_and_deny_every_command() -> Result<(), Box<dyn std:
     let config = Config::from_toml("", token_hash()?)?;
 
     assert_eq!(config.bind.get().to_string(), "127.0.0.1:8090");
-    assert_eq!(config.allowed_hosts.len(), 3);
-    assert_eq!(config.allowed_hosts[1].as_str(), "localhost:8090");
     assert_eq!(
-        config.allowed_hosts[2].as_str(),
-        "host.docker.internal:8090"
+        config
+            .allowed_hosts
+            .iter()
+            .map(AllowedHost::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "127.0.0.1:8090",
+            "localhost:8090",
+            "host.docker.internal:8090"
+        ]
     );
     assert!(config.allowed_origins.is_empty());
     assert!(config.allow_rules.is_empty());
@@ -85,12 +91,23 @@ max_concurrent = 2
     )?;
 
     assert_eq!(config.bind.get().to_string(), "0.0.0.0:9000");
-    assert_eq!(config.allowed_hosts[0].as_str(), "example.com:9000");
     assert_eq!(
-        config.allowed_origins[0].as_str(),
-        "https://example.com:9000"
+        config
+            .allowed_hosts
+            .iter()
+            .map(AllowedHost::as_str)
+            .collect::<Vec<_>>(),
+        vec!["example.com:9000"]
     );
-    assert_eq!(config.allow_rules[0].as_str(), "gh pr view*");
+    assert_eq!(
+        config
+            .allowed_origins
+            .iter()
+            .map(AllowedOrigin::as_str)
+            .collect::<Vec<_>>(),
+        vec!["https://example.com:9000"]
+    );
+    assert!(crate::policy::authorize("gh pr view 123", &config.allow_rules).is_ok());
     assert_eq!(config.max_runtime_ms.duration().as_millis(), 2500);
     assert_eq!(config.max_output_bytes.bytes(), 4096);
     assert_eq!(config.max_concurrent.get(), 2);
@@ -163,6 +180,20 @@ fn rejects_empty_and_multiline_allow_rules() {
             })
         ));
     }
+}
+
+#[test]
+fn rejects_allow_rules_with_invalid_shell_quotes() -> Result<(), Box<dyn std::error::Error>> {
+    let result = Config::from_toml(r#"allow_rules = ["gh 'pr view"]"#, token_hash()?);
+
+    assert!(matches!(
+        result,
+        Err(ConfigError::InvalidValue {
+            field: "allow_rules",
+            reason: "must use valid shell quoting"
+        })
+    ));
+    Ok(())
 }
 
 #[test]

@@ -23,9 +23,10 @@ const CURL_TIMEOUT_SECONDS: &str = "5";
 const CONFIG: &str = r#"
 bind = "127.0.0.1:{port}"
 allowed_hosts = ["127.0.0.1:{port}"]
-allow_rules = ["/usr/bin/printf *", "/bin/echo *", "/usr/bin/false *"]
+allow_rules = {allow_rules}
 max_runtime_ms = 5000
 max_output_bytes = 1048576
+max_concurrent = {max_concurrent}
 "#;
 
 static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -104,12 +105,21 @@ struct ServerFixture {
 
 impl ServerFixture {
     fn start() -> TestResult<Self> {
+        Self::start_with_rules(&["/usr/bin/printf *", "/bin/echo *", "/usr/bin/false *"], 4)
+    }
+
+    fn start_with_rules(allow_rules: &[&str], max_concurrent: usize) -> TestResult<Self> {
         let directory = TestDirectory::create()?;
         let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = reservation.local_addr()?.port();
         drop(reservation);
         let config_path = directory.path.join("server.toml");
-        fs::write(&config_path, CONFIG.replace("{port}", &port.to_string()))?;
+        let allow_rules = serde_json::to_string(allow_rules)?;
+        let config = CONFIG
+            .replace("{port}", &port.to_string())
+            .replace("{allow_rules}", &allow_rules)
+            .replace("{max_concurrent}", &max_concurrent.to_string());
+        fs::write(&config_path, config)?;
 
         let child = Command::new(env!("CARGO_BIN_EXE_backend"))
             .arg("--config")
@@ -674,6 +684,139 @@ fn nonzero_command_exit_is_reported_as_tool_error() -> TestResult {
             .and_then(|value| value.get("exit_code"))
             .and_then(Value::as_i64),
         Some(1)
+    );
+    Ok(())
+}
+
+#[test]
+fn exact_allow_rule_preserves_argument_boundaries() -> TestResult {
+    let server = ServerFixture::start_with_rules(&["/usr/bin/printf %s marker"], 1)?;
+    let allowed = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/usr/bin/printf %s marker"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    let denied = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/usr/bin/printf '%s marker'"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    assert_eq!(allowed.status, 200);
+    let allowed_message = allowed.mcp_message()?;
+    let allowed_result = allowed_message.pointer("/result/structuredContent");
+    assert_eq!(
+        allowed_result
+            .and_then(|value| value.get("stdout"))
+            .and_then(Value::as_str),
+        Some("marker")
+    );
+    assert_eq!(
+        allowed_result
+            .and_then(|value| value.get("exit_code"))
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+
+    assert_eq!(denied.status, 200);
+    let denied_message = denied.mcp_message()?;
+    assert_eq!(
+        denied_message
+            .pointer("/result/isError")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        denied_message
+            .pointer("/result/structuredContent/error")
+            .and_then(Value::as_str),
+        Some("command is not allowed")
+    );
+    assert_eq!(
+        denied_message.pointer("/result/structuredContent/stdout"),
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn signal_termination_is_reported_and_releases_execution_capacity() -> TestResult {
+    let server =
+        ServerFixture::start_with_rules(&["/bin/kill -TERM 0", "/usr/bin/printf alive"], 1)?;
+    let terminated = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/bin/kill -TERM 0"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    assert_eq!(terminated.status, 200);
+    let terminated_message = terminated.mcp_message()?;
+    let terminated_output = terminated_message.pointer("/result/structuredContent");
+    assert_eq!(
+        terminated_message
+            .pointer("/result/isError")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        terminated_output
+            .and_then(|value| value.get("signal"))
+            .and_then(Value::as_i64),
+        Some(15)
+    );
+    assert_eq!(
+        terminated_output.and_then(|value| value.get("exit_code")),
+        None
+    );
+    assert_eq!(
+        terminated_output
+            .and_then(|value| value.get("stdout"))
+            .and_then(Value::as_str),
+        Some("")
+    );
+    assert_eq!(
+        terminated_output
+            .and_then(|value| value.get("stderr"))
+            .and_then(Value::as_str),
+        Some("")
+    );
+
+    let after_signal = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/usr/bin/printf alive"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_eq!(after_signal.status, 200);
+    let after_signal_message = after_signal.mcp_message()?;
+    assert_eq!(
+        after_signal_message
+            .pointer("/result/isError")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        after_signal_message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some("alive")
+    );
+    assert_eq!(
+        after_signal_message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
     );
     Ok(())
 }
