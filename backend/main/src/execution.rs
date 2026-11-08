@@ -209,6 +209,12 @@ impl ProcessGroup {
             self.child.start_kill().map_err(ExecutionError::Wait)?;
         }
         self.child.wait().await.map_err(ExecutionError::Wait)?;
+        // Darwin can return EPERM for a group containing only zombies. Reaping our
+        // child can remove that group; a persistent permission error must still fail.
+        let signalled = match signalled {
+            Err(ExecutionError::Signal(Errno::EPERM)) => self.signal(),
+            result => result,
+        };
         self.identity = None;
         signalled
     }
