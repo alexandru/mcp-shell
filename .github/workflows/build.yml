@@ -17,7 +17,7 @@ jobs:
     name: quality (${{ matrix.platform }})
     strategy:
       fail-fast: false
-      matrix:
+      matrix: &native_platforms
         include:
           - platform: linux/amd64
             platform_name: amd64
@@ -232,20 +232,7 @@ jobs:
     needs: quality
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            platform_name: amd64
-            runner: ubuntu-24.04
-          - platform: linux/arm64
-            platform_name: arm64
-            runner: ubuntu-24.04-arm
-          - platform: macos/arm64
-            platform_name: macos-arm64
-            runner: macos-26
-          - platform: macos/amd64
-            platform_name: macos-amd64
-            runner: macos-26-intel
+      matrix: *native_platforms
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out repository

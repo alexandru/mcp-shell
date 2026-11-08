@@ -13,6 +13,7 @@ from urllib.parse import SplitResult, urlsplit
 from urllib.request import (
     HTTPSHandler,
     HTTPRedirectHandler,
+    OpenerDirector,
     ProxyHandler,
     Request,
     build_opener,
@@ -49,7 +50,7 @@ class RejectRedirectHandler(HTTPRedirectHandler):
         raise RedirectRejected
 
 
-def parse_endpoint(raw_url: str) -> tuple[SplitResult, bool]:
+def parse_endpoint(raw_url: str) -> SplitResult:
     if not raw_url or any(ord(character) <= 0x20 or ord(character) == 0x7F for character in raw_url):
         raise EndpointConfigurationError
 
@@ -73,20 +74,19 @@ def parse_endpoint(raw_url: str) -> tuple[SplitResult, bool]:
     ):
         raise EndpointConfigurationError
 
-    is_local_http = parsed.scheme == "http" and hostname.lower() in LOCAL_HTTP_HOSTS
-    if parsed.scheme == "http" and not is_local_http:
+    if parsed.scheme == "http" and hostname.lower() not in LOCAL_HTTP_HOSTS:
         raise EndpointConfigurationError
 
-    return parsed, is_local_http
+    return parsed
 
 
-def make_opener(parsed: SplitResult, is_local_http: bool, ca_cert: str | None) -> Any:
+def make_opener(parsed: SplitResult, ca_cert: str | None) -> OpenerDirector:
     try:
         tls_context = ssl.create_default_context(cafile=ca_cert)
     except (OSError, ssl.SSLError, ValueError) as error:
         raise EndpointConfigurationError from error
 
-    proxy_handler = ProxyHandler({}) if is_local_http else ProxyHandler()
+    proxy_handler = ProxyHandler({}) if parsed.scheme == "http" else ProxyHandler()
     handlers: list[Any] = [proxy_handler, RejectRedirectHandler()]
     if parsed.scheme == "https":
         handlers.append(HTTPSHandler(context=tls_context))
@@ -115,7 +115,7 @@ def request_payload(command: str, request_id: str) -> bytes:
                 "command": command,
                 "timeout_ms": REQUEST_TIMEOUT_MS,
             },
-                "_meta": request_metadata(),
+            "_meta": request_metadata(),
         },
     }
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -189,7 +189,7 @@ def successful_result(result: dict[str, Any] | None) -> bool:
 
 
 def execute_check(
-    opener: Any,
+    opener: OpenerDirector,
     url: str,
     token: str,
     command: str,
@@ -249,8 +249,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        parsed_url, is_local_http = parse_endpoint(arguments.url)
-        opener = make_opener(parsed_url, is_local_http, arguments.ca_cert)
+        parsed_url = parse_endpoint(arguments.url)
+        opener = make_opener(parsed_url, arguments.ca_cert)
     except Exception:
         print("Endpoint validation failed.", file=sys.stderr)
         return 2
