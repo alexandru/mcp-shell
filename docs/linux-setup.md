@@ -2,10 +2,10 @@
 
 ## Prerequisites
 
-Install stable Rust and Cargo, Bash, Git, OpenSSL, and a C build toolchain. Install
-the [GitHub CLI](https://cli.github.com/manual/installation) and [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
-if you will allow those commands. See the [Rust installation guide](https://www.rust-lang.org/tools/install)
-for Rust setup. Python 3 is required only for the optional authentication check.
+Install stable Rust/Cargo, Bash, Git, OpenSSL, and a C build toolchain. Install
+the [GitHub CLI](https://cli.github.com/manual/installation) or [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
+only if needed. See the [Rust installation guide](https://www.rust-lang.org/tools/install).
+Python 3 is required only for the optional authentication check.
 
 ## Build and configure
 
@@ -27,21 +27,19 @@ cp "$REPO_DIR/examples/server.toml" "$CONFIG_DIR/server.toml"
 cp "$REPO_DIR/examples/init.bash" "$CONFIG_DIR/init.bash"
 ```
 
-In `server.toml`, replace every `/Users/REPLACE_ME` with your absolute Linux
-home path, for example the output of `printf '%s\n' "$HOME"`. Set
-`initialization_file` and `working_directory` to the paths you use. Choose
-narrow `allow_rules` for the commands you need. The server binds to loopback by
-default.
+In `server.toml`, replace every `/Users/REPLACE_ME` with the absolute Linux home
+path from `printf '%s\n' "$HOME"`. Set `initialization_file` and
+`working_directory`, and choose narrow `allow_rules`. The server binds to loopback
+by default.
 
-Edit `init.bash` for this host. Keep it Bash-compatible and lightweight. Add the
-directories containing your allowed CLI tools to `PATH`, and configure the CLI
-authentication available to this Linux account. Do not assume that a macOS
-Keychain or device broker is available on Linux.
+Edit `init.bash` for this host. Keep it Bash-compatible and lightweight. Add
+allowed CLI directories to `PATH` and configure authentication for this Linux
+account; macOS Keychain or device broker access does not transfer to Linux.
 
 ## Create the client token
 
-The client token file and server verifier are private. Keep the raw token only
-for the client; the server receives its SHA-256 digest:
+Keep the raw client token and server verifier private. The server receives only
+the token's SHA-256 digest:
 
 ```sh
 CONFIG_DIR="$HOME/.config/mcp-shell"
@@ -52,8 +50,7 @@ openssl dgst -sha256 -r "$CONFIG_DIR/client-token" \
 chmod 600 "$CONFIG_DIR/client-token" "$CONFIG_DIR/server-token.sha256"
 ```
 
-Run the server as the account that owns this configuration. This command passes
-only the verifier to the server process:
+Run the server as this account. The process receives only the verifier:
 
 ```sh
 CONFIG_DIR="$HOME/.config/mcp-shell"
@@ -67,11 +64,10 @@ loopback when clients connect through a reverse proxy.
 ## Remote TLS
 
 Install Caddy using its [installation guide](https://caddyserver.com/docs/install).
-Copy [`examples/Caddyfile`](../examples/Caddyfile) into your server configuration
-directory. Replace `mcp.example.com` with the DNS name that resolves to this
-host. Set `allowed_hosts` in `server.toml` to the exact public authority used
-by the client, such as `mcp.example.com` for HTTPS on port 443. Caddy preserves
-the incoming `Host` header for this HTTP upstream.
+Copy [`examples/Caddyfile`](../examples/Caddyfile) into the server configuration
+directory. Replace `mcp.example.com` with this host's DNS name and set
+`allowed_hosts` to the exact client authority, such as `mcp.example.com` on
+HTTPS port 443. Caddy preserves the incoming `Host` header.
 
 Copy and start Caddy with:
 
@@ -88,17 +84,15 @@ caddy run --config "$HOME/.config/mcp-shell/Caddyfile" --adapter caddyfile
 ```
 
 Use your existing process supervisor for persistent service operation. Allow
-Caddy's TLS port through the firewall, plus any port required by its certificate
-challenge. Do not expose the server's loopback listener. Keep certificate
-verification enabled in clients; for a private CA, provide its public root to
-the client.
+Caddy's TLS port and any certificate-challenge port through the firewall, but
+do not expose the server listener. Keep client certificate verification enabled;
+provide the public CA root to clients when using a private CA.
 
 ## Check CLI authentication
 
-Authenticate `gh` and `az` for the same Linux account that runs the server. Verify
-them through the running server from a separate client terminal. Set the raw
-token only in that client environment, using the protected token file. If the
-client is on another host, provide the token through a protected secret mechanism.
+Authenticate the CLI tools for the Linux server account. From a separate client
+terminal, set the raw token only in the client environment. If the client is on
+another host, supply the token through a protected secret mechanism.
 
 ```sh
 REPO_DIR="$HOME/src/mcp-shell"
@@ -109,9 +103,7 @@ python3 "$REPO_DIR/scripts/auth-smoke.py" \
   --az-command 'az devops project list --organization https://dev.azure.com/ORG --output none'
 ```
 
-Replace `123`, `OWNER/REPO`, and `ORG` with the pull request, repository, and
-Azure DevOps organization to inspect. Choose commands that are read-only and
-allowed by `allow_rules`. If the endpoint uses a private CA, append
-`--ca-cert /path/to/public-root.pem`.
-The helper reports whether each command succeeded without printing command
-stdout.
+Replace `123` with a pull request number, `OWNER/REPO` with the repository, and
+`ORG` with the Azure DevOps organization. Choose read-only commands allowed by
+`allow_rules`. For a private CA, append `--ca-cert /path/to/public-root.pem`.
+The helper reports success without printing command stdout.
