@@ -16,6 +16,8 @@ Unquoted spaces and tabs separate words; newlines separate commands. Quote argum
 
 The server rejects syntax errors and unsupported or unknown constructs. Client expressions cannot contain function-definition syntax, use loops, conditionals, subshells or background commands, or use heredocs, here-strings, variable assignments, or variable, command, process, arithmetic, tilde, glob, or brace expansion. Quoting does not make an expansion literal: for example, `"$HOME"` is still an expansion and is rejected.
 
+The unquoted reserved syntax prefixes `time` and `coproc` are unsupported. Quoted or escaped executable names, and explicit external paths such as `/usr/bin/time`, remain ordinary invocations subject to the allow rules.
+
 ## Allow rules
 
 Each rule matches an executable invocation: its command name and arguments. Shell quotes group words in a rule, and literal word boundaries are preserved. For example, the rule `printf %s marker` has three words; it does not match `printf '%s marker'`, which has two.

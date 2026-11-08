@@ -1031,6 +1031,75 @@ fn rejects_unquoted_backslash_newline_and_accepts_quoted_abcd() -> TestResult {
 }
 
 #[test]
+fn rejects_bare_time_and_coproc_before_initialization() -> TestResult {
+    let server = ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(&[
+            "time /usr/bin/printf %s marker",
+            "coproc /usr/bin/printf %s marker",
+            "/usr/bin/printf %s marker",
+        ]),
+        initialization_file: Some(FixtureFile {
+            relative_path: "trusted init file.bash",
+            contents: "printf x >> 'init marker.txt'\n",
+        }),
+        working_directory: Some("working directory"),
+        ..ServerOptions::default()
+    })?;
+    let initialization_marker = server
+        .directory
+        .path
+        .join("working directory")
+        .join("init marker.txt");
+
+    for command in [
+        "time /usr/bin/printf %s marker",
+        "coproc /usr/bin/printf %s marker",
+    ] {
+        let response = server.post(
+            "tools/call",
+            Some("execute"),
+            &tool_call_body(json!({"command": command})),
+            Some(TOKEN),
+            "127.0.0.1",
+            None,
+        )?;
+
+        assert_policy_rejected_before_execution(&response, &initialization_marker)?;
+    }
+
+    let control = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/usr/bin/printf %s marker"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_eq!(control.status, 200);
+    let control_message = control.mcp_message()?;
+    assert_eq!(
+        control_message
+            .pointer("/result/isError")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        control_message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some("marker")
+    );
+    assert_eq!(
+        control_message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(fs::read_to_string(initialization_marker)?, "x");
+    Ok(())
+}
+
+#[test]
 fn signal_termination_is_reported_and_releases_execution_capacity() -> TestResult {
     let server =
         ServerFixture::start_with_rules(&["/bin/kill -TERM 0", "/usr/bin/printf alive"], 1)?;

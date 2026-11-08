@@ -238,6 +238,80 @@ fn rejects_dynamic_command_names_and_words() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn rejects_bare_time_and_coproc_reserved_prefixes() -> Result<(), Box<dyn std::error::Error>> {
+    for (command, exact_rule, wildcard_rule) in [
+        (
+            "time /usr/bin/printf %s marker",
+            "time /usr/bin/printf %s marker",
+            "time *",
+        ),
+        (
+            "coproc /usr/bin/printf %s marker",
+            "coproc /usr/bin/printf %s marker",
+            "coproc *",
+        ),
+    ] {
+        assert!(has_unsupported_syntax(command, &[exact_rule])?);
+        assert!(has_unsupported_syntax(command, &[wildcard_rule])?);
+    }
+    Ok(())
+}
+
+#[test]
+fn allows_quoted_escaped_and_concatenated_keyword_names_as_commands()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (command, rule) in [
+        (
+            "'time' /usr/bin/printf %s marker",
+            "time /usr/bin/printf %s marker",
+        ),
+        (
+            "\"coproc\" /usr/bin/printf %s marker",
+            "coproc /usr/bin/printf %s marker",
+        ),
+        (
+            r"\time /usr/bin/printf %s marker",
+            "time /usr/bin/printf %s marker",
+        ),
+        (
+            r"co\proc /usr/bin/printf %s marker",
+            "coproc /usr/bin/printf %s marker",
+        ),
+        (
+            "ti\"me\" /usr/bin/printf %s marker",
+            "time /usr/bin/printf %s marker",
+        ),
+        (
+            "co\"proc\" /usr/bin/printf %s marker",
+            "coproc /usr/bin/printf %s marker",
+        ),
+    ] {
+        assert_eq!(expression(command, &[rule])?.script(), command);
+    }
+    Ok(())
+}
+
+#[test]
+fn allows_explicit_time_executable_path() -> Result<(), Box<dyn std::error::Error>> {
+    let command = "/usr/bin/time /usr/bin/printf %s marker";
+
+    assert_eq!(expression(command, &[command])?.script(), command);
+    Ok(())
+}
+
+#[test]
+fn rejects_reserved_prefixes_spelled_with_line_continuations()
+-> Result<(), Box<dyn std::error::Error>> {
+    for command in [
+        "ti\\\nme /usr/bin/printf %s marker",
+        "co\\\nproc /usr/bin/printf %s marker",
+    ] {
+        assert!(is_rejected(command, &["time *", "coproc *"])?);
+    }
+    Ok(())
+}
+
+#[test]
 fn rejects_expansions_inside_double_quotes() -> Result<(), Box<dyn std::error::Error>> {
     for command in ["gh \"$HOME\"", "gh \"$(whoami)\"", "gh \"`whoami`\""] {
         assert!(matches!(

@@ -184,6 +184,9 @@ fn authorize_command(
     if executable.is_empty() {
         return Err(PolicyError::InvalidExecutable);
     }
+    if is_unquoted_reserved_prefix(name, source, &executable)? {
+        return Err(PolicyError::UnsupportedShellSyntax);
+    }
     let mut words = vec![executable];
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -208,6 +211,27 @@ fn authorize_command(
     } else {
         Err(PolicyError::NotAllowed)
     }
+}
+
+fn is_unquoted_reserved_prefix(
+    node: Node<'_>,
+    source: &str,
+    executable: &str,
+) -> Result<bool, PolicyError> {
+    if !matches!(executable, "time" | "coproc") {
+        return Ok(false);
+    }
+    let raw = node_text(node, source)?;
+    let mut normalized = String::with_capacity(raw.len());
+    let mut characters = raw.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' && characters.peek() == Some(&'\n') {
+            let _ = characters.next();
+        } else {
+            normalized.push(character);
+        }
+    }
+    Ok(normalized == executable)
 }
 
 fn validate_redirect(
