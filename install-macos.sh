@@ -459,6 +459,16 @@ install_macos_for_home() (
     fi
 
     printf 'Installed mcp-shell from %s and started %s.\n' "$ref" "$service_target"
+    printf '\nInstalled files:\n'
+    printf '  %-16s  %s\n' \
+        'Executable:' "$binary_file" \
+        'Configuration:' "$server_config" \
+        'Initialization:' "$init_file" \
+        'Client token:' "$client_token" \
+        'Server verifier:' "$verifier_file" \
+        'LaunchAgent:' "$plist_file" \
+        'Standard output:' "$stdout_log" \
+        'Standard error:' "$stderr_log"
 )
 
 usage() {
