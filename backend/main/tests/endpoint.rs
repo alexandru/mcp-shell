@@ -14,10 +14,18 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use rmcp::{
+    ClientLifecycleMode, ClientServiceExt,
+    model::{CallToolRequestParams, ClientConfig, JsonObject, ProtocolVersion},
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
+};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "mcp-shell-integration-test-token-2026-11-08-4a8e5fd1";
 const TOKEN_SHA256: &str = "77f8989c8328e9e6f9c5c6b0ce97e551a906b53ab514a32737e5d087a64d2809";
+const AUTH_SMOKE_SCRIPT: &str = "../../scripts/auth-smoke.py";
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const CURL_TIMEOUT_SECONDS: &str = "5";
 const CONFIG: &str = r#"
@@ -30,8 +38,8 @@ max_output_bytes = {max_output_bytes}
 max_concurrent = {max_concurrent}
 {optional_config}
 "#;
-const DEFAULT_ALLOW_RULES: &[&str] = &["/usr/bin/printf *", "/bin/echo *", "/usr/bin/false *"];
 const DEFAULT_ALLOWED_HOSTS: &[&str] = &["127.0.0.1"];
+const DEFAULT_ALLOW_RULES: &[&str] = &["/usr/bin/printf *", "/bin/echo *", "/usr/bin/false *"];
 const DEFAULT_MAX_CONCURRENT: ExecutionConcurrency = 4;
 const DEFAULT_RUNTIME_LIMIT: RuntimeMilliseconds = RuntimeMilliseconds(5_000);
 const DEFAULT_OUTPUT_LIMIT: OutputBytes = OutputBytes(1_048_576);
@@ -228,8 +236,9 @@ impl ServerFixture {
         let port = reservation.local_addr()?.port();
         drop(reservation);
         let config_path = directory.path.join("server.toml");
-        let allowed_hosts = options.allowed_hosts.unwrap_or(DEFAULT_ALLOWED_HOSTS);
-        let allowed_hosts = allowed_hosts
+        let allowed_hosts = options
+            .allowed_hosts
+            .unwrap_or(DEFAULT_ALLOWED_HOSTS)
             .iter()
             .map(|host| format!("{host}:{port}"))
             .collect::<Vec<_>>();
@@ -258,7 +267,7 @@ impl ServerFixture {
             .replace("{optional_config}", &optional_config);
         fs::write(&config_path, config)?;
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_backend"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-shell"));
         command
             .arg("--config")
             .arg(&config_path)
@@ -361,6 +370,8 @@ impl ServerFixture {
             "--silent",
             "--show-error",
             "--http1.1",
+            "--noproxy",
+            "*",
             "--max-time",
             CURL_TIMEOUT_SECONDS,
             "--request",
@@ -376,6 +387,11 @@ impl ServerFixture {
         .arg(format!("Host: {host}:{}", self.address.port()))
         .arg("--header")
         .arg(format!("Mcp-Method: {method}"));
+        curl.arg("--connect-to").arg(format!(
+            "{host}:{}:127.0.0.1:{}",
+            self.address.port(),
+            self.address.port()
+        ));
 
         if let Some(tool_name) = tool_name {
             curl.arg("--header").arg(format!("Mcp-Name: {tool_name}"));
@@ -395,7 +411,7 @@ impl ServerFixture {
             .arg(&response_path)
             .arg("--write-out")
             .arg("%{http_code}")
-            .arg(format!("http://{}/mcp", self.address))
+            .arg(format!("http://{host}:{}/mcp", self.address.port()))
             .output()?;
 
         if !output.status.success() {
@@ -582,6 +598,8 @@ impl CurlClient {
             "--show-error",
             "--no-buffer",
             "--http1.1",
+            "--noproxy",
+            "*",
             "--max-time",
             max_time.as_str(),
             "--request",
@@ -1095,6 +1113,84 @@ fn assert_successful_stdout(response: &HttpResponse, expected_stdout: &str) -> i
     Ok(())
 }
 
+fn run_auth_smoke(
+    server: &ServerFixture,
+    gh_command: &str,
+    az_command: &str,
+) -> TestResult<std::process::Output> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join(AUTH_SMOKE_SCRIPT);
+    let endpoint = format!("http://{}/mcp", server.address);
+    Ok(Command::new("python3")
+        .arg(script)
+        .arg("--url")
+        .arg(endpoint)
+        .arg("--gh-command")
+        .arg(gh_command)
+        .arg("--az-command")
+        .arg(az_command)
+        .env_clear()
+        .env("MCP_SHELL_TOKEN", TOKEN)
+        .output()?)
+}
+
+fn run_official_rmcp_client(server: &ServerFixture) -> io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_official_rmcp_client_async(server))
+}
+
+async fn run_official_rmcp_client_async(server: &ServerFixture) -> io::Result<()> {
+    let endpoint = format!("http://{}/mcp", server.address);
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(endpoint).auth_header(TOKEN),
+    );
+    let client = ClientConfig::default()
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .map_err(io::Error::other)?;
+
+    let probe = async {
+        let tools = client.list_tools(None).await.map_err(io::Error::other)?;
+        if !tools.tools.iter().any(|tool| tool.name == "execute") {
+            return Err(io::Error::other("server did not advertise execute"));
+        }
+
+        let arguments: JsonObject = serde_json::from_value(json!({
+            "command": "/usr/bin/printf %s marker"
+        }))
+        .map_err(io::Error::other)?;
+        let result = client
+            .call_tool(CallToolRequestParams::new("execute").with_arguments(arguments))
+            .await
+            .map_err(io::Error::other)?;
+        if result.is_error != Some(false) {
+            return Err(io::Error::other("execute returned an MCP error"));
+        }
+        let output = result
+            .structured_content
+            .ok_or_else(|| io::Error::other("execute omitted structured content"))?;
+        if output.get("stdout").and_then(Value::as_str) != Some("marker") {
+            return Err(io::Error::other("execute returned unexpected stdout"));
+        }
+        if output.get("exit_code").and_then(Value::as_i64) != Some(0) {
+            return Err(io::Error::other("execute returned a nonzero exit code"));
+        }
+        Ok(())
+    }
+    .await;
+
+    let cancellation = client.cancel().await.map_err(io::Error::other);
+    probe?;
+    cancellation?;
+    Ok(())
+}
+
 fn wait_for_response_body(
     client: &CurlClient,
     expected: &str,
@@ -1193,48 +1289,33 @@ fn rejects_untrusted_host_and_present_untrusted_origin() -> TestResult {
 }
 
 #[test]
-fn accepts_configured_hosts_and_origin_and_rejects_unconfigured_values() -> TestResult {
+fn accepts_configured_docker_and_proxy_hosts_and_origin() -> TestResult {
     let server = ServerFixture::start_with_options(ServerOptions {
         allowed_hosts: Some(&["host.docker.internal", "mcp.example.test"]),
         allowed_origins: &["https://mcp.example.test"],
-        allow_rules: Some(&["/bin/echo *"]),
         ..ServerOptions::default()
     })?;
 
-    for (host, command, expected_stdout) in [
-        (
-            "host.docker.internal",
-            "/bin/echo docker host",
-            "docker host\n",
-        ),
-        ("mcp.example.test", "/bin/echo proxy host", "proxy host\n"),
-    ] {
-        let response = server.post(
-            "tools/call",
-            Some("execute"),
-            &tool_call_body(json!({"command": command})),
-            Some(TOKEN),
-            host,
-            None,
-        )?;
-        assert_eq!(response.status, 200);
-        assert_eq!(
-            response
-                .mcp_message()?
-                .pointer("/result/structuredContent/stdout")
-                .and_then(Value::as_str),
-            Some(expected_stdout)
-        );
-    }
-
-    let configured_origin = server.post(
+    let docker_host = server.post(
         "tools/call",
         Some("execute"),
-        &tool_call_body(json!({"command": "/bin/echo configured origin"})),
+        &tool_call_body(json!({"command": "/bin/echo docker host"})),
+        Some(TOKEN),
+        "host.docker.internal",
+        None,
+    )?;
+    assert_successful_stdout(&docker_host, "docker host\n")?;
+
+    let public_proxy_host = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/bin/echo public proxy host"})),
         Some(TOKEN),
         "mcp.example.test",
         Some("https://mcp.example.test"),
     )?;
+    assert_successful_stdout(&public_proxy_host, "public proxy host\n")?;
+
     let unconfigured_host = server.post(
         "tools/call",
         Some("execute"),
@@ -1243,6 +1324,8 @@ fn accepts_configured_hosts_and_origin_and_rejects_unconfigured_values() -> Test
         "attacker.invalid",
         None,
     )?;
+    assert_eq!(unconfigured_host.status, 403);
+
     let unconfigured_origin = server.post(
         "tools/call",
         Some("execute"),
@@ -1251,9 +1334,6 @@ fn accepts_configured_hosts_and_origin_and_rejects_unconfigured_values() -> Test
         "mcp.example.test",
         Some("https://attacker.invalid"),
     )?;
-
-    assert_eq!(configured_origin.status, 200);
-    assert_eq!(unconfigured_host.status, 403);
     assert_eq!(unconfigured_origin.status, 403);
     Ok(())
 }
@@ -2502,5 +2582,70 @@ fn sigterm_shutdown_reaps_an_active_pipeline() -> TestResult {
     assert_eq!(server_status.code(), Some(0));
     group.wait_until_stopped(Duration::from_secs(5))?;
     let _client_status = client.wait_for_exit(Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn official_rmcp_client_discovers_lists_and_calls_over_http() -> TestResult {
+    let server = ServerFixture::start_with_rules(&["/usr/bin/printf %s marker"], 1)?;
+    run_official_rmcp_client(&server)?;
+    Ok(())
+}
+
+#[test]
+fn authentication_smoke_script_hides_command_output_and_token() -> TestResult {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join(AUTH_SMOKE_SCRIPT);
+    let help = Command::new("python3")
+        .arg(&script)
+        .arg("--help")
+        .env_clear()
+        .output()?;
+    assert!(help.status.success());
+    let help_text = String::from_utf8(help.stdout)?;
+    let normalized_help = help_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized_help.contains("operator must choose read-only commands"));
+
+    let github_sentinel = "private-github-response-sentinel";
+    let azure_sentinel = "private-azure-response-sentinel";
+    let denied_sentinel = "private-denied-response-sentinel";
+    let server = ServerFixture::start_with_rules(
+        &[
+            "/usr/bin/printf %s private-github-response-sentinel",
+            "/usr/bin/printf %s private-azure-response-sentinel",
+        ],
+        1,
+    )?;
+
+    let success = run_auth_smoke(
+        &server,
+        "/usr/bin/printf %s private-github-response-sentinel",
+        "/usr/bin/printf %s private-azure-response-sentinel",
+    )?;
+    assert!(success.status.success());
+    let success_stdout = String::from_utf8(success.stdout)?;
+    assert_eq!(
+        success_stdout,
+        "GitHub CLI authentication check passed.\nAzure CLI authentication check passed.\n"
+    );
+    let success_stderr = String::from_utf8(success.stderr)?;
+    assert!(success_stderr.is_empty());
+    assert!(!success_stdout.contains(TOKEN));
+    assert!(!success_stderr.contains(TOKEN));
+    assert!(!success_stdout.contains(github_sentinel));
+    assert!(!success_stdout.contains(azure_sentinel));
+
+    let denied = run_auth_smoke(
+        &server,
+        "/usr/bin/printf %s private-github-response-sentinel",
+        "/usr/bin/printf %s private-denied-response-sentinel",
+    )?;
+    assert!(!denied.status.success());
+    let denied_stdout = String::from_utf8(denied.stdout)?;
+    let denied_stderr = String::from_utf8(denied.stderr)?;
+    let denied_output = format!("{denied_stdout}{denied_stderr}");
+    assert!(!denied_output.contains(TOKEN));
+    assert!(!denied_output.contains(github_sentinel));
+    assert!(!denied_output.contains(azure_sentinel));
+    assert!(!denied_output.contains(denied_sentinel));
     Ok(())
 }

@@ -1,0 +1,21 @@
+# Replace REPLACE_ME paths with absolute paths owned by the server user.
+bind = "127.0.0.1:8090"
+# This direct host authority is usable only if the listener is reachable from Docker.
+# The local HTTPS proxy example uses host.docker.internal:8443 instead.
+allowed_hosts = [
+  "127.0.0.1:8090",
+  "host.docker.internal:8090",
+  "host.docker.internal:8443",
+  "mcp.example.com",
+]
+allowed_origins = []
+allow_rules = [
+  "gh pr view*",
+  "az devops project list*",
+  "head*",
+]
+initialization_file = "/Users/REPLACE_ME/.config/mcp-shell/init.bash"
+working_directory = "/Users/REPLACE_ME"
+max_runtime_ms = 60000
+max_output_bytes = 1048576
+max_concurrent = 4
