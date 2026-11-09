@@ -67,7 +67,7 @@ fn defaults_bind_to_loopback_and_deny_every_command() -> Result<(), Box<dyn std:
     assert!(config.allowed_origins.is_empty());
     assert!(config.allow_rules.is_empty());
     assert_eq!(config.max_runtime_ms.duration().as_millis(), 60_000);
-    assert_eq!(config.max_output_bytes.bytes(), 1_048_576);
+    assert!(config.max_output_bytes.is_none());
     assert_eq!(config.max_concurrent.get(), 4);
     assert!(config.initialization_file.is_none());
     assert_eq!(
@@ -126,7 +126,7 @@ max_concurrent = 2
     );
     assert!(crate::policy::authorize("gh pr view 123", &config.allow_rules).is_ok());
     assert_eq!(config.max_runtime_ms.duration().as_millis(), 2500);
-    assert_eq!(config.max_output_bytes.bytes(), 4096);
+    assert_eq!(config.max_output_bytes.map(OutputLimit::bytes), Some(4096));
     assert_eq!(config.max_concurrent.get(), 2);
     Ok(())
 }

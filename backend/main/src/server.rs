@@ -1,10 +1,10 @@
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::Duration};
 
 use axum::{
     Router,
     body::{Body, to_bytes},
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -23,11 +23,15 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    time::{Instant, MissedTickBehavior},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::{Config, RuntimeLimit},
+    delivery::{self, DeferredOutput},
     execution::Executor,
     policy,
 };
@@ -50,6 +54,7 @@ pub(crate) async fn serve(config: Config) -> Result<(), ServerError> {
         move || Ok(handler.clone()),
         Arc::new(NeverSessionManager::default()),
         StreamableHttpServerConfig::default()
+            .with_json_response(false)
             .with_allowed_hosts(config.allowed_hosts.iter().map(|host| host.as_str()))
             .with_allowed_origins(config.allowed_origins.iter().map(|origin| origin.as_str()))
             .enforce_origin_validation()
@@ -60,6 +65,10 @@ pub(crate) async fn serve(config: Config) -> Result<(), ServerError> {
     );
     let app = Router::new()
         .route_service("/mcp", transport)
+        .layer(middleware::from_fn_with_state(
+            shutdown.clone(),
+            delivery::stream_result,
+        ))
         .layer(middleware::from_fn_with_state(config, protect));
     eprintln!("mcp-shell listening on {address}");
     let signal_shutdown = shutdown.clone();
@@ -145,32 +154,54 @@ impl ServerHandler for CommandServer {
             Ok(expression) => expression,
             Err(error) => return Ok(tool_error(&error.to_string())),
         };
-        if let Some(progress_token) = context.meta.get_progress_token() {
+        let deferred_output = context
+            .extensions
+            .get::<Parts>()
+            .and_then(|parts| parts.extensions.get::<DeferredOutput>())
+            .cloned()
+            .ok_or_else(|| McpError::internal_error("missing output delivery context", None))?;
+        let execution = self
+            .executor
+            .execute(expression, context.ct, params.timeout_ms);
+        let result = if let Some(progress_token) = context.meta.get_progress_token() {
             context
                 .peer
                 .notify_progress(
-                    ProgressNotificationParam::new(progress_token, 0.0)
+                    ProgressNotificationParam::new(progress_token.clone(), 0.0)
                         .with_message("execution accepted"),
                 )
                 .await
                 .map_err(|_| {
                     McpError::internal_error("could not start execution response", None)
                 })?;
-        }
-        match self
-            .executor
-            .execute(expression, context.ct, params.timeout_ms)
-            .await
-        {
+            tokio::pin!(execution);
+            let started = Instant::now();
+            let mut heartbeat =
+                tokio::time::interval_at(started + PROGRESS_INTERVAL, PROGRESS_INTERVAL);
+            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    result = &mut execution => break result,
+                    _ = heartbeat.tick() => {
+                        context.peer.notify_progress(
+                            ProgressNotificationParam::new(progress_token.clone(), started.elapsed().as_secs_f64())
+                                .with_message("execution running"),
+                        ).await.map_err(|_| McpError::internal_error("could not report execution progress", None))?;
+                    }
+                }
+            }
+        } else {
+            execution.await
+        };
+        match result {
             Ok(output) => {
                 let succeeded = output.succeeded();
-                let result = serde_json::to_value(output).map_err(|_| {
-                    McpError::internal_error("could not serialize execution output", None)
-                })?;
+                deferred_output.store(output).await;
+                // The HTTP adapter serializes file-backed output after the SDK builds its envelope.
                 let result = if succeeded {
-                    CallToolResult::structured(result)
+                    CallToolResult::structured(json!({}))
                 } else {
-                    CallToolResult::structured_error(result)
+                    CallToolResult::structured_error(json!({}))
                 };
                 Ok(result.into())
             }
@@ -178,6 +209,8 @@ impl ServerHandler for CommandServer {
         }
     }
 }
+
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 type CommandText = String;
 

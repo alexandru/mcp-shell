@@ -19,7 +19,7 @@ pub struct Config {
     pub(crate) allowed_origins: Vec<AllowedOrigin>,
     pub(crate) allow_rules: Vec<AllowRule>,
     pub(crate) max_runtime_ms: RuntimeLimit,
-    pub(crate) max_output_bytes: OutputLimit,
+    pub(crate) max_output_bytes: Option<OutputLimit>,
     pub(crate) max_concurrent: ConcurrencyLimit,
     pub(crate) initialization_file: Option<InitializationFile>,
     pub(crate) working_directory: WorkingDirectory,
@@ -68,12 +68,7 @@ impl Config {
             .map(RuntimeLimit::from_millis)
             .transpose()?
             .unwrap_or(DEFAULT_RUNTIME);
-        let default_output_bytes = OutputLimit::new(1_048_576)?;
-        let max_output_bytes = raw
-            .max_output_bytes
-            .map(OutputLimit::new)
-            .transpose()?
-            .unwrap_or(default_output_bytes);
+        let max_output_bytes = raw.max_output_bytes.map(OutputLimit::new).transpose()?;
         let default_concurrent = ConcurrencyLimit::new(4)?;
         let max_concurrent = raw
             .max_concurrent
