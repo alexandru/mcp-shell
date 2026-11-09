@@ -17,6 +17,8 @@ use nix::{
     unistd::Pid,
 };
 use tokio::{
+    fs::File,
+    io::AsyncReadExt,
     runtime::Builder,
     task::JoinHandle,
     time::{Instant, sleep},
@@ -205,7 +207,13 @@ async fn exercise_output_limit_races(
                 .execute(recovery_expression, CancellationToken::new(), None)
                 .await;
             match recovered {
-                Ok(output) if output.succeeded() && output.stdout == "recovered" => (),
+                Ok(mut output) if output.succeeded() => {
+                    if read_captured_text(&mut output.stdout).await? != "recovered" {
+                        return Err(test_error(format!(
+                            "output-limit case {iteration}, command {command:?}: recovery command {OUTPUT_LIMIT_CONTROL_COMMAND:?} returned unexpected stdout"
+                        )));
+                    }
+                }
                 Ok(_) => {
                     return Err(test_error(format!(
                         "output-limit case {iteration}, command {command:?}: recovery command {OUTPUT_LIMIT_CONTROL_COMMAND:?} returned an unexpected result"
@@ -218,6 +226,57 @@ async fn exercise_output_limit_races(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn captures_uncapped_stdout_and_stderr_larger_than_one_mebibyte() -> Result<(), Box<dyn Error>> {
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(run_uncapped_capture_case())
+}
+
+async fn run_uncapped_capture_case() -> Result<(), Box<dyn Error>> {
+    let document = r#"
+allow_rules = ["/usr/bin/yes *", "/usr/bin/head *"]
+max_runtime_ms = 5000
+"#;
+    let config = Arc::new(Config::parse(document, &"00".repeat(32))?);
+    let executor = Executor::new(config.clone(), CancellationToken::new());
+    let expression = authorize(
+        "/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c 1048577; /usr/bin/yes 0 2>/dev/null | /usr/bin/head -c 1048577 1>&2",
+        &config.allow_rules,
+    )?;
+
+    let result = executor
+        .execute(expression, CancellationToken::new(), None)
+        .await;
+    executor.shutdown().await;
+    let mut output = result?;
+    if !output.succeeded() {
+        return Err(test_error(
+            "large uncapped capture did not exit successfully",
+        ));
+    }
+    if output.stdout.metadata().await?.len() != 1_048_577
+        || output.stderr.metadata().await?.len() != 1_048_577
+    {
+        return Err(test_error(
+            "large uncapped capture returned an unexpected byte count",
+        ));
+    }
+    let mut first_bytes = [0_u8; 1];
+    output.stdout.read_exact(&mut first_bytes).await?;
+    if first_bytes != *b"0" {
+        return Err(test_error(
+            "captured stdout was not rewound to its beginning",
+        ));
+    }
+    output.stderr.read_exact(&mut first_bytes).await?;
+    if first_bytes != *b"0" {
+        return Err(test_error(
+            "captured stderr was not rewound to its beginning",
+        ));
     }
     Ok(())
 }
@@ -277,7 +336,7 @@ async fn exercise_abort_and_reuse(
         cleanup.disarm();
     }
 
-    let output = executor
+    let mut output = executor
         .execute(control_expression, CancellationToken::new(), None)
         .await?;
     if !output.succeeded() {
@@ -285,10 +344,16 @@ async fn exercise_abort_and_reuse(
             "short command failed after cancellation cleanup",
         ));
     }
-    if output.stdout != "marker" {
+    if read_captured_text(&mut output.stdout).await? != "marker" {
         return Err(test_error("short command returned unexpected output"));
     }
     Ok(())
+}
+
+async fn read_captured_text(file: &mut File) -> Result<String, Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 async fn wait_for_running_group(pid_marker: &Path) -> Result<ProcessGroupId, Box<dyn Error>> {

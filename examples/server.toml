@@ -20,5 +20,4 @@ allow_rules = [
 # working_directory = "/absolute/path/to/working-directory"
 
 max_runtime_ms = 60000
-max_output_bytes = 1048576
 max_concurrent = 4

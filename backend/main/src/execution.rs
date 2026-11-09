@@ -17,9 +17,10 @@ use nix::{
 use serde::Serialize;
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    fs::File,
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::{Child, Command},
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -68,8 +69,7 @@ impl Executor {
         });
         self.tasks
             .spawn(async move {
-                let _permit = permit;
-                run(expression, config, cancellation, shutdown, runtime).await
+                run(expression, config, cancellation, shutdown, runtime, permit).await
             })
             .await
             .map_err(ExecutionError::Supervisor)?
@@ -82,15 +82,12 @@ impl Executor {
     }
 }
 
-#[derive(Serialize)]
 pub(crate) struct ExecutionOutput {
-    pub(crate) stdout: OutputText,
-    pub(crate) stderr: OutputText,
-    #[serde(flatten)]
-    termination: Termination,
+    pub(crate) stdout: File,
+    pub(crate) stderr: File,
+    pub(crate) termination: Termination,
+    pub(crate) _permit: OwnedSemaphorePermit,
 }
-
-pub(crate) type OutputText = String;
 
 impl ExecutionOutput {
     pub(crate) fn succeeded(&self) -> bool {
@@ -106,6 +103,14 @@ pub(crate) enum ExecutionError {
     Spawn(#[source] io::Error),
     #[error("could not capture command output")]
     Read(#[source] io::Error),
+    #[error("could not create output capture files")]
+    CaptureFile(#[source] io::Error),
+    #[error("could not create output capture files")]
+    CaptureFileTask(#[source] tokio::task::JoinError),
+    #[error("could not write captured output")]
+    CaptureWrite(#[source] io::Error),
+    #[error("could not finalize captured output")]
+    FinalizeCapture(#[source] io::Error),
     #[error("command output limit exceeded")]
     OutputLimit,
     #[error("command execution timed out")]
@@ -127,7 +132,7 @@ type SignalNumber = i32;
 
 #[derive(Serialize)]
 #[serde(untagged)]
-enum Termination {
+pub(crate) enum Termination {
     Exited { exit_code: ExitCode },
     Signalled { signal: SignalNumber },
 }
@@ -232,17 +237,29 @@ async fn run(
     cancellation: CancellationToken,
     shutdown: CancellationToken,
     runtime: RuntimeLimit,
+    permit: OwnedSemaphorePermit,
 ) -> Result<ExecutionOutput, ExecutionError> {
     if cancellation.is_cancelled() || shutdown.is_cancelled() {
         return Err(ExecutionError::Cancelled);
     }
+    let (stdout, stderr) = tokio::task::spawn_blocking(|| {
+        Ok::<_, io::Error>((tempfile::tempfile()?, tempfile::tempfile()?))
+    })
+    .await
+    .map_err(ExecutionError::CaptureFileTask)?
+    .map_err(ExecutionError::CaptureFile)?;
+    let stdout = File::from_std(stdout);
+    let stderr = File::from_std(stderr);
+    if cancellation.is_cancelled() || shutdown.is_cancelled() {
+        return Err(ExecutionError::Cancelled);
+    }
     let mut group = ProcessGroup::start(&expression, &config)?;
-    let stdout = group
+    let stdout_pipe = group
         .child
         .stdout
         .take()
         .ok_or(ExecutionError::ChildState)?;
-    let stderr = group
+    let stderr_pipe = group
         .child
         .stderr
         .take()
@@ -251,8 +268,8 @@ async fn run(
     let result = {
         let collect = async {
             tokio::try_join!(
-                read_output(stdout, &captured, config.max_output_bytes),
-                read_output(stderr, &captured, config.max_output_bytes),
+                capture_output(stdout_pipe, stdout, &captured, config.max_output_bytes),
+                capture_output(stderr_pipe, stderr, &captured, config.max_output_bytes),
                 async { group.child.wait().await.map_err(ExecutionError::Wait) },
             )
         };
@@ -264,9 +281,11 @@ async fn run(
         }
     };
     match result {
-        Ok((stdout, stderr, status)) => {
+        Ok((mut stdout, mut stderr, status)) => {
             group.identity = None;
-            output(stdout, stderr, status)
+            tokio::try_join!(finalize_capture(&mut stdout), finalize_capture(&mut stderr),)
+                .map_err(ExecutionError::FinalizeCapture)?;
+            output(stdout, stderr, status, permit)
         }
         Err(error) => {
             group.stop().await?;
@@ -303,42 +322,59 @@ fn is_shell_startup_variable(name: &OsStr) -> bool {
     name.starts_with(b"BASH_FUNC_") || shell_startup_variables.contains(&name)
 }
 
-async fn read_output(
-    mut stream: impl AsyncRead + Unpin,
+async fn capture_output(
+    mut source: impl AsyncRead + Unpin,
+    mut destination: File,
     captured: &AtomicUsize,
-    limit: OutputLimit,
-) -> Result<Vec<u8>, ExecutionError> {
-    let mut output = Vec::new();
+    limit: Option<OutputLimit>,
+) -> Result<File, ExecutionError> {
     let mut buffer = [0_u8; 8192];
-    let limit = limit.bytes();
     loop {
-        let count = stream
+        let count = source
             .read(&mut buffer)
             .await
             .map_err(ExecutionError::Read)?;
         if count == 0 {
-            return Ok(output);
+            return Ok(destination);
         }
-        captured
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(count).filter(|total| *total <= limit)
-            })
-            .map_err(|_| ExecutionError::OutputLimit)?;
-        if let Some(bytes) = buffer.get(..count) {
-            output.extend_from_slice(bytes);
+        if let Some(limit) = limit {
+            captured
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current
+                        .checked_add(count)
+                        .filter(|total| *total <= limit.bytes())
+                })
+                .map_err(|_| ExecutionError::OutputLimit)?;
         }
+        let bytes = buffer.get(..count).ok_or_else(|| {
+            ExecutionError::Read(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "read count exceeds the capture buffer",
+            ))
+        })?;
+        destination
+            .write_all(bytes)
+            .await
+            .map_err(ExecutionError::CaptureWrite)?;
     }
 }
 
+async fn finalize_capture(file: &mut File) -> Result<(), io::Error> {
+    file.flush().await?;
+    file.rewind().await.map(|_| ())
+}
+
 fn output(
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: File,
+    stderr: File,
     status: ExitStatus,
+    permit: OwnedSemaphorePermit,
 ) -> Result<ExecutionOutput, ExecutionError> {
     Ok(ExecutionOutput {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout,
+        stderr,
         termination: Termination::try_from(status)?,
+        _permit: permit,
     })
 }
 

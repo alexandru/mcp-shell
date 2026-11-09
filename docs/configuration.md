@@ -19,8 +19,8 @@ The file is TOML. Unknown fields are rejected.
 | `allowed_origins` | `[]` | Allowed browser origins. Requests without an `Origin` header are accepted. |
 | `allow_rules` | `[]` | Command patterns. An empty list denies every command. |
 | `max_runtime_ms` | `60000` | Maximum request runtime, from 1 to 86400000 ms. |
-| `max_output_bytes` | `1048576` | Combined stdout and stderr limit in bytes; must be positive. |
-| `max_concurrent` | `4` | Maximum running requests; must be positive. Excess requests return busy instead of waiting. |
+| `max_output_bytes` | Omitted | Optional combined stdout and stderr limit in bytes; when set, it must be positive. |
+| `max_concurrent` | `4` | Maximum requests capturing or delivering output at once; must be positive. Excess requests return busy instead of waiting. |
 | `initialization_file` | Omitted | Optional absolute path to an existing regular file. |
 | `working_directory` | Server's current directory | Optional absolute path to an existing directory. |
 
@@ -66,12 +66,24 @@ the request limit.
 
 The `execute` tool accepts optional `timeout_ms` from 1 to 86400000. The server
 uses the smaller of this value and `max_runtime_ms`; if omitted, it uses
-`max_runtime_ms`. A timeout returns an execution error if the response can be
-delivered. A timeout or request cancellation stops the command process group
-with `SIGKILL` and waits for the direct child. A completed command returns
-`stdout`, `stderr`, and either `exit_code` or `signal`; a nonzero exit or signal
-is a tool error. Exceeding the output limit stops the command and returns a
-tool error.
+`max_runtime_ms`. Output is captured to temporary files while the command runs,
+then returned in the final MCP result. The server uses bounded memory while
+capturing and delivering output. Temporary files are closed and deleted after
+the response is delivered or the request is cancelled. Disk space and execution
+time remain finite resources. Set `max_output_bytes` to impose an optional
+combined limit; exceeding it stops the command and returns an execution error.
+
+When a client supplies a standard MCP progress token, the server sends an
+`execution accepted` notification, then an `execution running` notification
+every second while the command runs. It also sends SSE keepalive comments during
+long requests, even when the client does not supply a progress token. These
+notifications report status; command output is returned in the final result,
+not as incremental stdout/stderr chunks.
+A timeout returns an execution error if the response can be delivered. A timeout
+or request cancellation stops the command process group with `SIGKILL` and waits
+for the direct child. A completed command returns `stdout`, `stderr`, and either
+`exit_code` or `signal`; a nonzero exit or signal is a tool error. Temporary-file
+creation and write failures stop the command and return an execution error.
 
 Detached processes and processes the server cannot signal may survive
 cancellation. Network failures can delay cancellation detection.

@@ -34,7 +34,7 @@ allowed_hosts = {allowed_hosts}
 allowed_origins = {allowed_origins}
 allow_rules = {allow_rules}
 max_runtime_ms = {max_runtime_ms}
-max_output_bytes = {max_output_bytes}
+{max_output_bytes_config}
 max_concurrent = {max_concurrent}
 {optional_config}
 "#;
@@ -248,7 +248,10 @@ impl ServerFixture {
             serde_json::to_string(options.allow_rules.unwrap_or(DEFAULT_ALLOW_RULES))?;
         let max_concurrent = options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
         let max_runtime_ms = options.max_runtime_ms.unwrap_or(DEFAULT_RUNTIME_LIMIT);
-        let max_output_bytes = options.max_output_bytes.unwrap_or(DEFAULT_OUTPUT_LIMIT);
+        let max_output_bytes_config = options
+            .max_output_bytes
+            .map(|limit| format!("max_output_bytes = {}\n", limit.0))
+            .unwrap_or_default();
         let mut optional_config = String::new();
         if let Some(path) = initialization_file.as_deref() {
             append_config_path(&mut optional_config, "initialization_file", path)?;
@@ -262,7 +265,7 @@ impl ServerFixture {
             .replace("{allowed_origins}", &allowed_origins)
             .replace("{allow_rules}", &allow_rules)
             .replace("{max_runtime_ms}", &max_runtime_ms.0.to_string())
-            .replace("{max_output_bytes}", &max_output_bytes.0.to_string())
+            .replace("{max_output_bytes_config}", &max_output_bytes_config)
             .replace("{max_concurrent}", &max_concurrent.to_string())
             .replace("{optional_config}", &optional_config);
         fs::write(&config_path, config)?;
@@ -486,6 +489,9 @@ struct HttpResponse {
 #[derive(Clone, Copy)]
 struct ClientTimeoutSeconds(u64);
 
+#[derive(Clone, Copy)]
+struct BytesPerSecond(usize);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ProcessId(u32);
 
@@ -577,6 +583,15 @@ impl CurlClient {
         body: &str,
         timeout: ClientTimeoutSeconds,
     ) -> TestResult<Self> {
+        Self::start_with_rate_limit(server, body, timeout, None)
+    }
+
+    fn start_with_rate_limit(
+        server: &ServerFixture,
+        body: &str,
+        timeout: ClientTimeoutSeconds,
+        bytes_per_second: Option<BytesPerSecond>,
+    ) -> TestResult<Self> {
         let response_id = NEXT_RESPONSE_ID.fetch_add(1, Ordering::Relaxed);
         let response_path = server
             .directory
@@ -611,6 +626,9 @@ impl CurlClient {
             "--header",
             "MCP-Protocol-Version: 2026-07-28",
         ])
+        .args(bytes_per_second.map_or_else(Vec::new, |limit| {
+            vec!["--limit-rate".to_owned(), limit.0.to_string()]
+        }))
         .arg("--header")
         .arg(format!("Host: 127.0.0.1:{}", server.address.port()))
         .arg("--header")
@@ -1019,6 +1037,7 @@ const EXECUTION_ALLOW_RULES: &[&str] = &[
     "/bin/cat *",
     "/usr/bin/printf *",
     "/usr/bin/yes *",
+    "/usr/bin/head *",
     "/usr/bin/tee *",
 ];
 const PROCESS_ID_INITIALIZATION: FixtureFile<'static> = FixtureFile {
@@ -1038,6 +1057,20 @@ fn start_execution_server(
         max_concurrent: Some(max_concurrent),
         max_runtime_ms: Some(max_runtime_ms),
         max_output_bytes: Some(max_output_bytes),
+        initialization_file: Some(PROCESS_ID_INITIALIZATION),
+        working_directory: Some(PROCESS_MARKER_DIRECTORY),
+        ..ServerOptions::default()
+    })
+}
+
+fn start_uncapped_execution_server(
+    max_concurrent: ExecutionConcurrency,
+    max_runtime_ms: RuntimeMilliseconds,
+) -> TestResult<ServerFixture> {
+    ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(EXECUTION_ALLOW_RULES),
+        max_concurrent: Some(max_concurrent),
+        max_runtime_ms: Some(max_runtime_ms),
         initialization_file: Some(PROCESS_ID_INITIALIZATION),
         working_directory: Some(PROCESS_MARKER_DIRECTORY),
         ..ServerOptions::default()
@@ -1133,14 +1166,20 @@ fn run_auth_smoke(
         .output()?)
 }
 
-fn run_official_rmcp_client(server: &ServerFixture) -> io::Result<()> {
+fn run_official_rmcp_client(
+    server: &ServerFixture,
+    large_output_length: Option<usize>,
+) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run_official_rmcp_client_async(server))
+    runtime.block_on(run_official_rmcp_client_async(server, large_output_length))
 }
 
-async fn run_official_rmcp_client_async(server: &ServerFixture) -> io::Result<()> {
+async fn run_official_rmcp_client_async(
+    server: &ServerFixture,
+    large_output_length: Option<usize>,
+) -> io::Result<()> {
     let endpoint = format!("http://{}/mcp", server.address);
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(endpoint).auth_header(TOKEN),
@@ -1181,6 +1220,34 @@ async fn run_official_rmcp_client_async(server: &ServerFixture) -> io::Result<()
         if output.get("exit_code").and_then(Value::as_i64) != Some(0) {
             return Err(io::Error::other("execute returned a nonzero exit code"));
         }
+
+        if let Some(length) = large_output_length {
+            let command = format!("/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {length}");
+            let arguments: JsonObject =
+                serde_json::from_value(json!({"command": command})).map_err(io::Error::other)?;
+            let result = client
+                .call_tool(CallToolRequestParams::new("execute").with_arguments(arguments))
+                .await
+                .map_err(io::Error::other)?;
+            if result.is_error != Some(false) {
+                return Err(io::Error::other(format!(
+                    "large execute returned an MCP error: isError={:?}, {}",
+                    result.is_error,
+                    structured_diagnostics(result.structured_content.as_ref()),
+                )));
+            }
+            let output = result
+                .structured_content
+                .ok_or_else(|| io::Error::other("large execute omitted structured content"))?;
+            let stdout = output
+                .get("stdout")
+                .and_then(Value::as_str)
+                .ok_or_else(|| io::Error::other("large execute omitted stdout"))?;
+            let expected = "0\n".repeat(length / 2);
+            if stdout != expected {
+                return Err(io::Error::other("large execute returned incomplete stdout"));
+            }
+        }
         Ok(())
     }
     .await;
@@ -1207,6 +1274,70 @@ fn wait_for_response_body(
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "expected response body event did not arrive",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn response_events(body: &str) -> Vec<Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str(data.trim_start()).ok())
+        .collect()
+}
+
+fn progress_events(body: &str) -> Vec<Value> {
+    response_events(body)
+        .into_iter()
+        .filter(|message| {
+            message.get("method").and_then(Value::as_str) == Some("notifications/progress")
+        })
+        .collect()
+}
+
+fn tool_output_diagnostics(message: &Value) -> String {
+    let structured = message.pointer("/result/structuredContent");
+    format!(
+        "isError={:?}, {}",
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        structured_diagnostics(structured),
+    )
+}
+
+fn structured_diagnostics(structured: Option<&Value>) -> String {
+    let short = |path: &str| {
+        structured
+            .and_then(|value| value.pointer(path))
+            .and_then(Value::as_str)
+            .map(|value| value.chars().take(256).collect::<String>())
+    };
+    format!(
+        "error={:?}, stderr_prefix={:?}, exit_code={:?}, signal={:?}",
+        short("/error"),
+        short("/stderr"),
+        structured.and_then(|value| value.get("exit_code")),
+        structured.and_then(|value| value.get("signal")),
+    )
+}
+
+fn wait_for_progress_events(
+    client: &CurlClient,
+    expected_count: usize,
+    timeout: Duration,
+) -> io::Result<String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("progress deadline overflowed"))?;
+    loop {
+        let body = client.response_body()?;
+        if progress_events(&body).len() >= expected_count {
+            return Ok(body);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "expected MCP progress notifications did not arrive",
             ));
         }
         thread::sleep(Duration::from_millis(25));
@@ -2371,6 +2502,66 @@ fn cancels_disconnected_clients_before_response_and_after_progress_event() -> Te
 }
 
 #[test]
+fn streams_increasing_progress_until_silent_command_finishes() -> TestResult {
+    let server = start_uncapped_execution_server(1, RuntimeMilliseconds(15_000))?;
+    let mut client = CurlClient::start(
+        &server,
+        &execution_body("/bin/sleep 5", None, true),
+        ClientTimeoutSeconds(10),
+    )?;
+
+    let body = wait_for_progress_events(&client, 3, Duration::from_secs(4))?;
+    let progress = progress_events(&body);
+    assert!(progress.len() >= 3);
+    let mut previous = None;
+    for event in progress {
+        let params = event
+            .get("params")
+            .ok_or_else(|| io::Error::other("progress notification omitted params"))?;
+        assert_eq!(
+            params.get("progressToken").and_then(Value::as_str),
+            Some("mcp-shell-integration-test")
+        );
+        let current = params
+            .get("progress")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| io::Error::other("progress notification omitted a numeric value"))?;
+        if let Some(previous) = previous {
+            assert!(current > previous, "progress value did not increase");
+        }
+        previous = Some(current);
+    }
+    assert!(
+        !body.contains("\"result\":"),
+        "final result arrived before the silent command completed"
+    );
+
+    let response = client.completed_response(Duration::from_secs(8))?;
+    let events = response_events(&response.body);
+    assert!(events.iter().any(|message| message.get("id").is_some()));
+    Ok(())
+}
+
+#[test]
+fn does_not_send_progress_notifications_without_a_progress_token() -> TestResult {
+    let server = start_uncapped_execution_server(1, RuntimeMilliseconds(15_000))?;
+    let mut client = CurlClient::start(
+        &server,
+        &execution_body("/bin/sleep 2", None, false),
+        ClientTimeoutSeconds(10),
+    )?;
+
+    let response = client.completed_response(Duration::from_secs(8))?;
+    assert!(progress_events(&response.body).is_empty());
+    assert!(
+        response_events(&response.body)
+            .iter()
+            .any(|message| message.get("id").is_some())
+    );
+    Ok(())
+}
+
+#[test]
 fn curl_timeout_cancels_a_live_pipeline() -> TestResult {
     let server = start_execution_server(1, RuntimeMilliseconds(30_000), DEFAULT_OUTPUT_LIMIT)?;
     let marker = process_marker_path(&server);
@@ -2503,6 +2694,237 @@ fn output_overflow_stops_stdout_stderr_and_combined_output_and_releases_capacity
 }
 
 #[test]
+fn returns_large_stdout_and_stderr_without_an_explicit_output_limit() -> TestResult {
+    const OUTPUT_LENGTH: usize = 1_100_000;
+    const PREFIX: &str = "literal | [value] €";
+    let server = start_uncapped_execution_server(1, RuntimeMilliseconds(30_000))?;
+    let command = format!(
+        "/usr/bin/printf 'literal | [value] €'; /usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {OUTPUT_LENGTH}; /usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {OUTPUT_LENGTH} 1>&2"
+    );
+    let response = server.post(
+        "tools/call",
+        Some("execute"),
+        &execution_body(&command, None, false),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    assert_eq!(response.status, 200);
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(false),
+        "large output result: {}",
+        tool_output_diagnostics(&message)
+    );
+    let structured = message
+        .pointer("/result/structuredContent")
+        .ok_or_else(|| io::Error::other("successful tool result omitted structured content"))?;
+    let expected_output = "0\n".repeat(OUTPUT_LENGTH / 2);
+    let expected_stdout = format!("{PREFIX}{expected_output}");
+    let expected_stderr = expected_output;
+    assert_eq!(
+        structured.get("stdout").and_then(Value::as_str),
+        Some(expected_stdout.as_str())
+    );
+    assert_eq!(
+        structured.get("stderr").and_then(Value::as_str),
+        Some(expected_stderr.as_str())
+    );
+    assert_eq!(structured.get("exit_code").and_then(Value::as_i64), Some(0));
+
+    let fallback = message
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("tool result omitted its text fallback"))?;
+    let fallback: Value = serde_json::from_str(fallback)?;
+    assert_eq!(&fallback, structured);
+    Ok(())
+}
+
+#[test]
+fn output_capture_storage_failure_is_reported_and_recoverable() -> TestResult {
+    const CAPTURE_ALLOW_RULES: &[&str] = &["/usr/bin/printf *"];
+    const CAPTURE_DIRECTORY: &str = "missing-capture-dir";
+    const WORKING_DIRECTORY: &str = "capture failure working directory";
+    let environment = [TestEnvironment {
+        name: "TMPDIR",
+        value: TestEnvironmentValue::FixturePath(CAPTURE_DIRECTORY),
+    }];
+    let server = ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(CAPTURE_ALLOW_RULES),
+        max_concurrent: Some(1),
+        max_runtime_ms: Some(RuntimeMilliseconds(15_000)),
+        working_directory: Some(WORKING_DIRECTORY),
+        environment: &environment,
+        ..ServerOptions::default()
+    })?;
+    let marker = server
+        .directory
+        .path
+        .join(WORKING_DIRECTORY)
+        .join("capture marker.txt");
+    let command = "/usr/bin/printf started > 'capture marker.txt'; /usr/bin/printf %s recovered";
+
+    let failed = server.post(
+        "tools/call",
+        Some("execute"),
+        &execution_body(command, None, false),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_tool_error_without_output(&failed, Some("could not create output capture files"))?;
+    assert!(
+        !marker.exists(),
+        "client command ran despite capture setup failure"
+    );
+
+    fs::create_dir(server.directory.path.join(CAPTURE_DIRECTORY))?;
+    let recovered = server.post(
+        "tools/call",
+        Some("execute"),
+        &execution_body(command, None, false),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_successful_stdout(&recovered, "recovered")?;
+    assert_eq!(fs::read_to_string(marker)?, "started");
+    Ok(())
+}
+
+#[test]
+fn preserves_utf8_boundaries_and_replaces_invalid_output_bytes() -> TestResult {
+    const PREFIX_LENGTH: usize = 8_191;
+    let server = start_uncapped_execution_server(1, RuntimeMilliseconds(15_000))?;
+    let command = "/usr/bin/printf '%08191d\\342\\202\\254'; /usr/bin/printf '%08191d\\377' 1>&2";
+    let response = server.post(
+        "tools/call",
+        Some("execute"),
+        &execution_body(command, None, false),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+
+    let message = response.mcp_message()?;
+    let structured = message
+        .pointer("/result/structuredContent")
+        .ok_or_else(|| io::Error::other("successful tool result omitted structured content"))?;
+    assert_eq!(
+        structured.get("stdout").and_then(Value::as_str),
+        Some(format!("{}€", "0".repeat(PREFIX_LENGTH)).as_str())
+    );
+    assert_eq!(
+        structured.get("stderr").and_then(Value::as_str),
+        Some(format!("{}�", "0".repeat(PREFIX_LENGTH)).as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn client_disconnect_during_large_result_delivery_releases_execution_capacity() -> TestResult {
+    const OUTPUT_LENGTH: usize = 8_388_608;
+    let server = start_uncapped_execution_server(1, RuntimeMilliseconds(30_000))?;
+    let command = format!("/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {OUTPUT_LENGTH}");
+    let mut client = CurlClient::start_with_rate_limit(
+        &server,
+        &execution_body(&command, None, false),
+        ClientTimeoutSeconds(30),
+        Some(BytesPerSecond(64 * 1024)),
+    )?;
+
+    wait_for_response_body(&client, "\"result\":", Duration::from_secs(10))?;
+    client.cancel()?;
+
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(3))
+        .ok_or_else(|| io::Error::other("capacity recovery deadline overflowed"))?;
+    loop {
+        let recovered = server.post(
+            "tools/call",
+            Some("execute"),
+            &execution_body("/usr/bin/printf %s recovered", None, false),
+            Some(TOKEN),
+            "127.0.0.1",
+            None,
+        )?;
+        let message = recovered.mcp_message()?;
+        match message.pointer("/result/isError").and_then(Value::as_bool) {
+            Some(false) => {
+                assert_successful_stdout(&recovered, "recovered")?;
+                break;
+            }
+            Some(true)
+                if message
+                    .pointer("/result/structuredContent/error")
+                    .and_then(Value::as_str)
+                    == Some("execution capacity is exhausted") =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "execution capacity was not released after client disconnect",
+                    )
+                    .into());
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                return Err(
+                    io::Error::other("recovery request returned an unexpected result").into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sigterm_shutdown_stops_large_result_delivery_promptly() -> TestResult {
+    const OUTPUT_LENGTH: usize = 8_388_608;
+    let mut server = start_uncapped_execution_server(1, RuntimeMilliseconds(30_000))?;
+    let marker = process_marker_path(&server);
+    let previous_marker_count = process_id_marker_count(&marker)?;
+    let command = format!("/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {OUTPUT_LENGTH}");
+    let mut client = CurlClient::start_with_rate_limit(
+        &server,
+        &execution_body(&command, None, false),
+        ClientTimeoutSeconds(30),
+        Some(BytesPerSecond(64 * 1024)),
+    )?;
+    let mut group = ProcessGroupGuard::default();
+    group.watch_marker(&marker, previous_marker_count);
+
+    wait_for_response_body(&client, "\"result\":", Duration::from_secs(10))?;
+    let process_id =
+        wait_for_new_process_id_marker(&marker, previous_marker_count, Duration::from_secs(5))?
+            .ok_or_else(|| {
+                io::Error::other("large-output command did not write its process marker")
+            })?;
+    group.register_shell(process_id);
+
+    let shutdown_started = Instant::now();
+    let server_status = server.terminate_gracefully(Duration::from_secs(5))?;
+    assert_eq!(server_status.code(), Some(0));
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(5),
+        "server shutdown waited for the large response to finish"
+    );
+    let _client_status = client.wait_for_exit(Duration::from_secs(5))?;
+    group.wait_until_stopped(Duration::from_secs(5))?;
+    assert!(
+        !response_events(&client.response_body()?)
+            .iter()
+            .any(|event| event.get("result").is_some()),
+        "client received a complete final result after server shutdown"
+    );
+    Ok(())
+}
+
+#[test]
 fn client_cancellation_releases_single_execution_capacity() -> TestResult {
     let server = start_execution_server(1, RuntimeMilliseconds(30_000), DEFAULT_OUTPUT_LIMIT)?;
     let marker = process_marker_path(&server);
@@ -2588,7 +3010,14 @@ fn sigterm_shutdown_reaps_an_active_pipeline() -> TestResult {
 #[test]
 fn official_rmcp_client_discovers_lists_and_calls_over_http() -> TestResult {
     let server = ServerFixture::start_with_rules(&["/usr/bin/printf %s marker"], 1)?;
-    run_official_rmcp_client(&server)?;
+    run_official_rmcp_client(&server, None)?;
+    Ok(())
+}
+
+#[test]
+fn official_rmcp_client_receives_output_above_former_default_limit() -> TestResult {
+    let server = start_uncapped_execution_server(1, RuntimeMilliseconds(30_000))?;
+    run_official_rmcp_client(&server, Some(1_100_000))?;
     Ok(())
 }
 
