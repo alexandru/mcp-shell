@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import plistlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -48,6 +49,7 @@ class InstallerTests(unittest.TestCase):
             "FAKE_BOOTSTRAP_FAIL": "0",
             "FAKE_PID_MODE": "stable",
             "FAKE_PLATFORM": "Darwin",
+            "FAKE_RUSTC_HOST": "aarch64-apple-darwin",
             "REAL_OPENSSL": self.real_openssl,
         }
         self.write_fake_tools()
@@ -89,15 +91,28 @@ if [ "$FAKE_BUILD_FAIL" = "1" ]; then
     exit 1
 fi
 target=
+explicit_target=
 while [ "$#" -gt 0 ]; do
-    if [ "$1" = "--target-dir" ]; then
-        shift
-        target=$1
-    fi
+    case "$1" in
+        --target-dir)
+            shift
+            target=$1
+            ;;
+        --target)
+            shift
+            explicit_target=$1
+            ;;
+    esac
     shift
 done
-mkdir -p "$target/release"
-printf '%s\n' 'synthetic mcp-shell binary' > "$target/release/mcp-shell"
+artifact_dir="$target"
+if [ -n "$explicit_target" ]; then
+    artifact_dir="$artifact_dir/$explicit_target"
+elif [ -n "${CARGO_BUILD_TARGET:-}" ]; then
+    artifact_dir="$artifact_dir/$CARGO_BUILD_TARGET"
+fi
+mkdir -p "$artifact_dir/release"
+printf '%s\n' 'synthetic mcp-shell binary' > "$artifact_dir/release/mcp-shell"
 ''',
         )
         self.write_tool(
@@ -168,7 +183,10 @@ esac
 exit 0
 ''',
         )
-        self.write_tool("rustc", "#!/bin/sh\nexit 0\n")
+        self.write_tool(
+            "rustc",
+            '#!/bin/sh\nif [ "$1" = "--print" ] && [ "$2" = "host-tuple" ]; then\nprintf "%s\\n" "$FAKE_RUSTC_HOST"\nelse\nexit 2\nfi\n',
+        )
         self.write_tool("cc", "#!/bin/sh\nexit 0\n")
         self.write_tool("sleep", "#!/bin/sh\nexit 0\n")
 
@@ -195,6 +213,33 @@ exit 0
             check=False,
         )
 
+    def run_stdin_installer(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["/bin/bash", "-s", "--", *arguments],
+            input=INSTALLER.read_text(encoding="utf-8"),
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+
+    def run_bash_c_installer(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                INSTALLER.read_text(encoding="utf-8"),
+                "installer-test",
+                *arguments,
+            ],
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+
     def read_log(self) -> str:
         return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
 
@@ -213,6 +258,94 @@ exit 0
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("--ref REF", result.stdout)
+
+    def test_stdin_help_executes_main(self) -> None:
+        result = self.run_stdin_installer("--help")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Usage: install-macos.sh", result.stdout)
+        self.assertIn("--ref REF", result.stdout)
+
+    def test_stdin_bad_argument_returns_usage_error(self) -> None:
+        result = self.run_stdin_installer("--unknown")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown argument: --unknown", result.stderr)
+        self.assertIn("Usage: install-macos.sh", result.stderr)
+
+    def test_bash_c_executes_main_and_sourcing_does_not(self) -> None:
+        bash_c_result = self.run_bash_c_installer("--help")
+        self.assertEqual(bash_c_result.returncode, 0)
+        self.assertIn("Usage: install-macos.sh", bash_c_result.stdout)
+
+        sourced_result = subprocess.run(
+            ["/bin/bash", "-c", 'source "$1"; printf "source-ok\\n"', "source-test", str(INSTALLER)],
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(sourced_result.returncode, 0)
+        self.assertEqual(sourced_result.stdout, "source-ok\n")
+        self.assertEqual(sourced_result.stderr, "")
+
+    def test_readme_install_command_propagates_curl_failure(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        code_block = re.search(r"```sh\n(.*?)\n```", readme, re.DOTALL)
+        self.assertIsNotNone(code_block)
+        self.assertIsNotNone(code_block and code_block.group(1).strip())
+        command = code_block.group(1).strip()
+        prefix = "/bin/bash -o pipefail -c '"
+        self.assertTrue(command.startswith(prefix))
+        self.assertTrue(command.endswith("'"))
+        bare_pipeline = command[len(prefix):-1]
+
+        self.write_tool(
+            "curl",
+            r'''#!/bin/sh
+if [ "$FAKE_CURL_STATUS" -ne 0 ]; then
+    exit "$FAKE_CURL_STATUS"
+fi
+printf '%s\n' "printf 'pipeline-ran\\n'"
+''',
+        )
+        env = os.environ.copy()
+        env["PATH"] = f"{self.fake_bin}:{env.get('PATH', os.defpath)}"
+        env["FAKE_CURL_STATUS"] = "0"
+        success = subprocess.run(
+            ["/bin/bash", "-c", command],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(success.returncode, 0)
+        self.assertEqual(success.stdout, "pipeline-ran\n")
+
+        env["FAKE_CURL_STATUS"] = "22"
+        bare_failure = subprocess.run(
+            ["/bin/bash", "-c", bare_pipeline],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(bare_failure.returncode, 0)
+        self.assertEqual(bare_failure.stdout, "")
+
+        wrapped_failure = subprocess.run(
+            ["/bin/bash", "-c", command],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(wrapped_failure.returncode, 22)
+        self.assertEqual(wrapped_failure.stdout, "")
 
     def test_installs_escaped_config_plist_and_private_files(self) -> None:
         result = self.run_installer("refs/pull/11/merge")
@@ -264,6 +397,15 @@ exit 0
         log = self.read_log()
         self.assertLess(log.index("cargo build"), log.index(f"launchctl print gui/501/{LABEL}"))
         self.assertGreaterEqual(log.count(f"launchctl print gui/501/{LABEL}"), 3)
+
+    def test_build_uses_compiler_host_when_cargo_target_environment_is_set(self) -> None:
+        self.env["CARGO_BUILD_TARGET"] = "wasm32-unknown-unknown"
+
+        result = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--target aarch64-apple-darwin", self.read_log())
+        self.assertTrue((self.home / ".local/bin/mcp-shell").is_file())
 
     def test_existing_files_are_preserved_on_rerun(self) -> None:
         first = self.run_installer()

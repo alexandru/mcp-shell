@@ -107,13 +107,18 @@ jobs:
 
       - name: Install and validate native macOS service
         if: runner.os == 'macOS'
+        env:
+          INSTALLER_URL: https://raw.githubusercontent.com/alexandru/mcp-shell/${{ github.sha }}/install-macos.sh
+          CARGO_BUILD_TARGET: wasm32-unknown-unknown
         run: |
           set -euo pipefail
           cleanup() {
             /bin/launchctl bootout "gui/$(/usr/bin/id -u)/io.github.alexandru.mcp-shell" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
-          /bin/bash install-macos.sh --ref "$GITHUB_REF"
+          /bin/bash -o pipefail -c 'curl -fsSL "$INSTALLER_URL" | /bin/bash -s -- --ref "$GITHUB_SHA"'
+          python3 scripts/check-macos-install.py
+          /bin/launchctl kill SIGTERM "gui/$(/usr/bin/id -u)/io.github.alexandru.mcp-shell"
           python3 scripts/check-macos-install.py
 
   docker:

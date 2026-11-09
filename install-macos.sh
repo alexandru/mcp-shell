@@ -220,8 +220,14 @@ install_macos_for_home() (
         installer_error "could not check out the requested ref"
         return 1
     fi
+    if ! native_target="$(cd "$source_dir/backend" && rustc --print host-tuple 2>/dev/null)" \
+        || [[ -z "$native_target" || "$native_target" == *[!a-zA-Z0-9_-]* ]]; then
+        installer_error "could not determine the Rust compiler host target"
+        return 1
+    fi
     if ! (cd "$source_dir/backend" && cargo build --locked --release \
-        --package backend --bin mcp-shell --target-dir "$work_dir/build"); then
+        --package backend --bin mcp-shell --target "$native_target" \
+        --target-dir "$work_dir/build"); then
         installer_error "the native server build failed; the installed service was not changed"
         return 1
     fi
@@ -358,7 +364,7 @@ install_macos_for_home() (
     chmod 600 "$client_token" "$verifier_file"
 
     binary_tmp="$bin_dir/.mcp-shell.$$"
-    if ! install -m 755 "$work_dir/build/release/mcp-shell" "$binary_tmp" \
+    if ! install -m 755 "$work_dir/build/$native_target/release/mcp-shell" "$binary_tmp" \
         || ! mv -f "$binary_tmp" "$binary_file"; then
         unset verifier
         installer_error "could not install the server binary"
@@ -494,6 +500,6 @@ main() {
     install_macos_for_home "$HOME" "$ref"
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     main "$@"
 fi
