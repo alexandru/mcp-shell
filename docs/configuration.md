@@ -1,8 +1,8 @@
 # Configuration
 
-The macOS installer writes `~/.config/mcp-shell/server.toml` and
-`~/.config/mcp-shell/init.bash`. It preserves both files when you run it again.
-The server must run as an operating-system user who has the allowed CLI tools
+The macOS and Ubuntu installers write `~/.config/mcp-shell/server.toml` and
+`~/.config/mcp-shell/init.bash`. They preserve those files when run again. The
+server must run as an operating-system user who has the allowed CLI tools
 installed and authenticated.
 
 After startup, run an allowed read-only command through the server to verify the
@@ -108,3 +108,37 @@ rm "$HOME/Library/LaunchAgents/io.github.alexandru.mcp-shell.plist"
 Remove `~/.local/bin/mcp-shell`, `~/.config/mcp-shell/`, and
 `~/Library/Logs/mcp-shell/` only if you also want to delete the installed
 binary, configuration, token, and logs.
+
+## Ubuntu service
+
+The Ubuntu installer stores the binary at `~/.local/bin/mcp-shell`, the
+configuration and token files in `~/.config/mcp-shell/`, and the user unit at
+`~/.config/systemd/user/mcp-shell.service`. It enables user lingering so the
+service can run after logout. Logs go to the user journal.
+
+Check status and follow logs with:
+
+```sh
+systemctl --user status mcp-shell.service
+journalctl --user -u mcp-shell.service -f
+```
+
+After changing `server.toml`, restart the service:
+
+```sh
+systemctl --user restart mcp-shell.service
+```
+
+To stop the service and remove its unit while retaining the binary,
+configuration, and token:
+
+```sh
+systemctl --user disable --now mcp-shell.service
+rm "$HOME/.config/systemd/user/mcp-shell.service"
+systemctl --user daemon-reload
+```
+
+The installer does not disable user lingering during removal because other user
+services may depend on it. Remove `~/.local/bin/mcp-shell` and
+`~/.config/mcp-shell/` only if you also want to delete the binary, configuration,
+and token.

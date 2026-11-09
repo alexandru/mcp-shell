@@ -1,65 +1,52 @@
-# Install on Linux
+# Install on Ubuntu
 
-The one-command installer is for macOS. On Linux, build and run the server as
-the operating-system user that owns the CLI configuration and authentication.
-The server does not install `gh`, `az`, or Caddy.
-
-## Build and configure the server
-
-Install stable Rust/Cargo, Git, OpenSSL, Bash, a C compiler, and the CLI tools
-you will allow. Authenticate those tools as the user who will run the server.
-Clone the repository into a new directory and build the native binary:
+The one-command installer supports Ubuntu. Run it as your non-root user from a
+login session with an active systemd user manager. It enables user lingering so
+the service can run after logout. Requires stable Rust/Cargo, Git, OpenSSL, and
+a C compiler. Install and authenticate any CLI tools you plan to allow as this
+same user; the installer does not install them.
 
 ```sh
-mkdir -p "$HOME/src"
-git clone https://github.com/alexandru/mcp-shell.git "$HOME/src/mcp-shell"
-cd "$HOME/src/mcp-shell/backend"
-native_target="$(rustc --print host-tuple)"
-cargo build --locked --release --package backend --bin mcp-shell \
-  --target "$native_target" --target-dir target
-install -d "$HOME/.local/bin"
-install -m 755 "target/$native_target/release/mcp-shell" "$HOME/.local/bin/mcp-shell"
+/bin/bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/alexandru/mcp-shell/main/linux-install.sh | /bin/bash'
 ```
 
-Create a private configuration directory and copy the examples:
+The installer builds the server, creates `~/.local/bin/mcp-shell`, the
+configuration, initialization file, client token and server verifier in
+`~/.config/mcp-shell/`, and the user unit at
+`~/.config/systemd/user/mcp-shell.service`. It starts the service. It preserves
+your existing configuration, initialization file, and client token when run
+again.
+
+Review `server.toml` to choose command rules and hosts, and edit `init.bash` for
+the CLI paths and trusted Bash-compatible setup. Initialization changes apply
+to the next request. Restart the service after changing `server.toml`. See
+[Configuration](configuration.md) for settings and service commands.
+
+## Remote HTTPS
+
+For a remote client, point a DNS name such as `mcp.example.com` at the Ubuntu
+server and allow inbound ports 80 and 443 in its firewall and cloud security
+group. Caddy uses these ports to obtain and serve public HTTPS certificates;
+see its [automatic HTTPS requirements](https://caddyserver.com/docs/automatic-https#overview).
+Install Caddy using its [official Debian/Ubuntu package
+instructions](https://caddyserver.com/docs/install#debian-ubuntu-raspbian).
+
+Add `mcp.example.com` to `allowed_hosts` in
+`~/.config/mcp-shell/server.toml`. Then restart mcp-shell before connecting:
 
 ```sh
-umask 077
-mkdir -p "$HOME/.config/mcp-shell"
-chmod 700 "$HOME/.config/mcp-shell"
-cp "$HOME/src/mcp-shell/examples/server.toml" "$HOME/.config/mcp-shell/server.toml"
-cp "$HOME/src/mcp-shell/examples/init.bash" "$HOME/.config/mcp-shell/init.bash"
+systemctl --user restart mcp-shell.service
 ```
 
-Edit `server.toml`: uncomment `initialization_file` and set it to the full
-absolute path to the copied file. TOML does not expand `~` or `$HOME`. If
-needed, uncomment `working_directory` and set it to an existing absolute path.
-Select the commands to allow and set `allowed_hosts` to the exact authority
-your client will send. Edit `init.bash` for Linux CLI paths and compatible
-authentication setup. The trusted Bash-compatible file runs for every request.
+Set the Caddy site in `/etc/caddy/Caddyfile` to your DNS name:
 
-## Remote HTTPS on Debian or Ubuntu
-
-Complete this section before starting `mcp-shell` remotely, so the hostname is
-already in `allowed_hosts`. These steps use Caddy's official Debian/Ubuntu
-systemd package. Point the hostname's DNS A/AAAA record at this server and
-allow inbound ports 80 and 443 in the server firewall and cloud security group.
-Caddy uses these ports to obtain and serve public HTTPS certificates; see its
-[automatic HTTPS requirements](https://caddyserver.com/docs/automatic-https#overview).
-
-Install Caddy using the [official Debian/Ubuntu package instructions](https://caddyserver.com/docs/install#debian-ubuntu-raspbian).
-
-The package starts the `caddy` systemd service. Copy the [example Caddyfile](../examples/Caddyfile)
-to the service path, then replace `mcp.example.com` with your DNS name in
-both that file and `server.toml`:
-
-```sh
-sudo cp "$HOME/src/mcp-shell/examples/Caddyfile" /etc/caddy/Caddyfile
-sudoedit /etc/caddy/Caddyfile
+```caddyfile
+mcp.example.com {
+    reverse_proxy 127.0.0.1:8090
+}
 ```
 
-Add the same hostname to `allowed_hosts` in `server.toml`. Enable Caddy and
-reload it after editing its configuration:
+Apply the Caddy configuration and check the service:
 
 ```sh
 sudo systemctl enable --now caddy
@@ -67,38 +54,10 @@ sudo systemctl reload caddy
 systemctl status caddy --no-pager
 ```
 
-See Caddy's official [systemd service guide](https://caddyserver.com/docs/running#using-the-service).
+See Caddy's [systemd service guide](https://caddyserver.com/docs/running#using-the-service).
 
-## Start the server
-
-Keep `mcp-shell` in the logged-in CLI user's foreground shell. It uses only the
-SHA-256 verifier in its environment; the client token stays in a private file:
-
-```sh
-set -euo pipefail
-umask 077
-openssl rand -hex 32 | tr -d '\n' > "$HOME/.config/mcp-shell/client-token"
-chmod 600 "$HOME/.config/mcp-shell/client-token"
-
-MCP_SHELL_TOKEN_SHA256="$(openssl dgst -sha256 -r "$HOME/.config/mcp-shell/client-token" | awk '{print $1}')" \
-  "$HOME/.local/bin/mcp-shell" --config "$HOME/.config/mcp-shell/server.toml"
-```
-
-For a Codex client, follow [Connect a Codex client](client-connection.md), use
-`https://mcp.example.com/mcp` as the URL, and provide the raw token to the
-client as `MCP_SHELL_TOKEN`. Transfer `client-token` to the client host through
-a private channel; do not put the raw token in the server environment.
-
-To check CLI authentication through the running server, use the optional
-[`scripts/auth-smoke.py`](../scripts/auth-smoke.py) helper from another shell
-as the CLI user. It requires Python 3 and the client token. Replace `OWNER`,
-`REPO`, `ORG`, and `123` with values for read-only commands allowed by your
-policy:
-
-```sh
-export MCP_SHELL_TOKEN="$(cat "$HOME/.config/mcp-shell/client-token")"
-python3 "$HOME/src/mcp-shell/scripts/auth-smoke.py" \
-  --url https://mcp.example.com/mcp \
-  --gh-command 'gh pr view 123 --repo OWNER/REPO --json title' \
-  --az-command 'az devops project list --organization https://dev.azure.com/ORG --output none'
-```
+In the client configuration, use `https://mcp.example.com/mcp`. Transfer
+`~/.config/mcp-shell/client-token` to the client through a private channel and
+provide its contents as the client's `MCP_SHELL_TOKEN` environment variable.
+Keep that raw token out of the server environment. See [Connect a Codex
+client](client-connection.md) for Codex configuration.

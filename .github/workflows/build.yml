@@ -104,6 +104,48 @@ jobs:
           python3 -B -m unittest discover -s scripts/tests
           bash -n examples/init.bash
           bash -n install-macos.sh
+          bash -n linux-install.sh
+
+      - name: Install and validate native Ubuntu service
+        if: runner.os == 'Linux'
+        env:
+          INSTALLER_URL: https://raw.githubusercontent.com/alexandru/mcp-shell/${{ github.sha }}/linux-install.sh
+          CARGO_BUILD_TARGET: wasm32-unknown-unknown
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          runtime_dir="/run/user/$uid"
+          initial_linger="$(loginctl show-user "$uid" -p Linger --value)"
+          if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+            if [[ ! -S "$runtime_dir/bus" || ! -O "$runtime_dir/bus" ]]; then
+              echo "the Ubuntu runner has no owned user systemd bus at $runtime_dir/bus" >&2
+              exit 1
+            fi
+            export XDG_RUNTIME_DIR="$runtime_dir"
+          fi
+          if [[ "$XDG_RUNTIME_DIR" != "$runtime_dir" || ! -S "$runtime_dir/bus" || ! -O "$runtime_dir/bus" ]]; then
+            echo "the Ubuntu runner user systemd runtime does not match UID $uid" >&2
+            exit 1
+          fi
+          systemctl --user show-environment >/dev/null
+
+          cleanup() {
+            local result=$?
+            trap - EXIT
+            systemctl --user disable --now mcp-shell.service >/dev/null 2>&1 || true
+            rm -f "$HOME/.config/systemd/user/mcp-shell.service"
+            systemctl --user daemon-reload >/dev/null 2>&1 || true
+            if [[ "$initial_linger" == no ]]; then
+              loginctl disable-linger "$uid" >/dev/null 2>&1 || true
+            fi
+            exit "$result"
+          }
+          trap cleanup EXIT
+
+          /bin/bash -o pipefail -c 'curl -fsSL "$INSTALLER_URL" | /bin/bash -s -- --ref "$GITHUB_SHA"'
+          python3 scripts/check-linux-install.py
+          systemctl --user restart mcp-shell.service
+          python3 scripts/check-linux-install.py
 
       - name: Install and validate native macOS service
         if: runner.os == 'macOS'
@@ -275,7 +317,8 @@ jobs:
           cp backend/target/release/mcp-shell "$package_dir/mcp-shell"
           cp -R README.md examples docs scripts "$package_dir/"
           cp install-macos.sh "$package_dir/install-macos.sh"
-          tar -czf "$RUNNER_TEMP/$archive_name" -C "$package_dir" mcp-shell README.md examples docs scripts install-macos.sh
+          cp linux-install.sh "$package_dir/linux-install.sh"
+          tar -czf "$RUNNER_TEMP/$archive_name" -C "$package_dir" mcp-shell README.md examples docs scripts install-macos.sh linux-install.sh
           (cd "$RUNNER_TEMP" && shasum -a 256 "$archive_name" > "$archive_name.sha256")
 
       - name: Upload native artifact
