@@ -1168,7 +1168,7 @@ fn run_auth_smoke(
 
 fn run_official_rmcp_client(
     server: &ServerFixture,
-    large_output_length: Option<usize>,
+    large_output_length: Option<OutputBytes>,
 ) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1178,7 +1178,7 @@ fn run_official_rmcp_client(
 
 async fn run_official_rmcp_client_async(
     server: &ServerFixture,
-    large_output_length: Option<usize>,
+    large_output_length: Option<OutputBytes>,
 ) -> io::Result<()> {
     let endpoint = format!("http://{}/mcp", server.address);
     let transport = StreamableHttpClientTransport::from_config(
@@ -1222,7 +1222,7 @@ async fn run_official_rmcp_client_async(
         }
 
         if let Some(length) = large_output_length {
-            let command = format!("/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {length}");
+            let command = format!("/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {}", length.0);
             let arguments: JsonObject =
                 serde_json::from_value(json!({"command": command})).map_err(io::Error::other)?;
             let result = client
@@ -1243,7 +1243,7 @@ async fn run_official_rmcp_client_async(
                 .get("stdout")
                 .and_then(Value::as_str)
                 .ok_or_else(|| io::Error::other("large execute omitted stdout"))?;
-            let expected = "0\n".repeat(length / 2);
+            let expected = "0\n".repeat(length.0 / 2);
             if stdout != expected {
                 return Err(io::Error::other("large execute returned incomplete stdout"));
             }
@@ -2695,11 +2695,12 @@ fn output_overflow_stops_stdout_stderr_and_combined_output_and_releases_capacity
 
 #[test]
 fn returns_large_stdout_and_stderr_without_an_explicit_output_limit() -> TestResult {
-    const OUTPUT_LENGTH: usize = 1_100_000;
+    const OUTPUT_LENGTH: OutputBytes = OutputBytes(1_100_000);
     const PREFIX: &str = "literal | [value] €";
     let server = start_uncapped_execution_server(1, RuntimeMilliseconds(30_000))?;
     let command = format!(
-        "/usr/bin/printf 'literal | [value] €'; /usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {OUTPUT_LENGTH}; /usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {OUTPUT_LENGTH} 1>&2"
+        "/usr/bin/printf 'literal | [value] €'; /usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {}; /usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {} 1>&2",
+        OUTPUT_LENGTH.0, OUTPUT_LENGTH.0
     );
     let response = server.post(
         "tools/call",
@@ -2721,7 +2722,7 @@ fn returns_large_stdout_and_stderr_without_an_explicit_output_limit() -> TestRes
     let structured = message
         .pointer("/result/structuredContent")
         .ok_or_else(|| io::Error::other("successful tool result omitted structured content"))?;
-    let expected_output = "0\n".repeat(OUTPUT_LENGTH / 2);
+    let expected_output = "0\n".repeat(OUTPUT_LENGTH.0 / 2);
     let expected_stdout = format!("{PREFIX}{expected_output}");
     let expected_stderr = expected_output;
     assert_eq!(
@@ -2797,7 +2798,7 @@ fn output_capture_storage_failure_is_reported_and_recoverable() -> TestResult {
 
 #[test]
 fn preserves_utf8_boundaries_and_replaces_invalid_output_bytes() -> TestResult {
-    const PREFIX_LENGTH: usize = 8_191;
+    const PREFIX_LENGTH: OutputBytes = OutputBytes(8_191);
     let server = start_uncapped_execution_server(1, RuntimeMilliseconds(15_000))?;
     let command = "/usr/bin/printf '%08191d\\342\\202\\254'; /usr/bin/printf '%08191d\\377' 1>&2";
     let response = server.post(
@@ -2815,20 +2816,23 @@ fn preserves_utf8_boundaries_and_replaces_invalid_output_bytes() -> TestResult {
         .ok_or_else(|| io::Error::other("successful tool result omitted structured content"))?;
     assert_eq!(
         structured.get("stdout").and_then(Value::as_str),
-        Some(format!("{}€", "0".repeat(PREFIX_LENGTH)).as_str())
+        Some(format!("{}€", "0".repeat(PREFIX_LENGTH.0)).as_str())
     );
     assert_eq!(
         structured.get("stderr").and_then(Value::as_str),
-        Some(format!("{}�", "0".repeat(PREFIX_LENGTH)).as_str())
+        Some(format!("{}�", "0".repeat(PREFIX_LENGTH.0)).as_str())
     );
     Ok(())
 }
 
 #[test]
 fn client_disconnect_during_large_result_delivery_releases_execution_capacity() -> TestResult {
-    const OUTPUT_LENGTH: usize = 8_388_608;
+    const OUTPUT_LENGTH: OutputBytes = OutputBytes(8_388_608);
     let server = start_uncapped_execution_server(1, RuntimeMilliseconds(30_000))?;
-    let command = format!("/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {OUTPUT_LENGTH}");
+    let command = format!(
+        "/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {}",
+        OUTPUT_LENGTH.0
+    );
     let mut client = CurlClient::start_with_rate_limit(
         &server,
         &execution_body(&command, None, false),
@@ -2884,11 +2888,14 @@ fn client_disconnect_during_large_result_delivery_releases_execution_capacity() 
 
 #[test]
 fn sigterm_shutdown_stops_large_result_delivery_promptly() -> TestResult {
-    const OUTPUT_LENGTH: usize = 8_388_608;
+    const OUTPUT_LENGTH: OutputBytes = OutputBytes(8_388_608);
     let mut server = start_uncapped_execution_server(1, RuntimeMilliseconds(30_000))?;
     let marker = process_marker_path(&server);
     let previous_marker_count = process_id_marker_count(&marker)?;
-    let command = format!("/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {OUTPUT_LENGTH}");
+    let command = format!(
+        "/usr/bin/yes 0 2>/dev/null | /usr/bin/head -c {}",
+        OUTPUT_LENGTH.0
+    );
     let mut client = CurlClient::start_with_rate_limit(
         &server,
         &execution_body(&command, None, false),
@@ -3018,7 +3025,7 @@ fn official_rmcp_client_discovers_lists_and_calls_over_http() -> TestResult {
 #[test]
 fn official_rmcp_client_receives_output_above_former_default_limit() -> TestResult {
     let server = start_uncapped_execution_server(1, RuntimeMilliseconds(30_000))?;
-    run_official_rmcp_client(&server, Some(1_100_000))?;
+    run_official_rmcp_client(&server, Some(OutputBytes(1_100_000)))?;
     Ok(())
 }
 
