@@ -1,12 +1,20 @@
 # mcp-shell
 
-`mcp-shell` is an authenticated MCP server that runs authorized Bash-compatible
-shell expressions as the operating-system user that starts the server.
+An authenticated MCP server that runs allowed Bash-compatible shell expressions
+as the operating-system user who starts it.
 
-The allow rules authorize executable invocations. They do not sandbox allowed
-commands: a command can read and write files, start subprocesses, use its extensions,
-and shell redirections can write files. Use commands and rules you trust.
+## Install on macOS
 
-Start with the [setup guide](docs/setup.md). See [shell policy](docs/shell-policy.md)
-for expression and rule behavior, and [cancellation limits](docs/cancellation.md)
-for timeout, output, and process cleanup behavior.
+Requires stable Rust/Cargo and Xcode Command Line Tools. Run as your logged-in
+macOS user.
+
+```sh
+/bin/bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/alexandru/mcp-shell/main/install-macos.sh | /bin/bash'
+```
+
+The installer builds the server, creates its configuration and token, and starts
+its per-user LaunchAgent.
+
+- [Connect a client](docs/client-connection.md)
+- [Configure commands and limits](docs/configuration.md)
+- [Install on Linux or a VPS](docs/linux-setup.md)
