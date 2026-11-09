@@ -9,7 +9,18 @@ name = "backend"
 path = "src/main.rs"
 
 [dependencies]
-signal-hook.workspace = true
+axum.workspace = true
+nix.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true
