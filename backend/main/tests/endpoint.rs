@@ -2913,7 +2913,8 @@ fn sigterm_shutdown_stops_large_result_delivery_promptly() -> TestResult {
         shutdown_started.elapsed() < Duration::from_secs(5),
         "server shutdown waited for the large response to finish"
     );
-    let _client_status = client.wait_for_exit(Duration::from_secs(5))?;
+    // The rate-limited client can keep draining bytes buffered before server shutdown.
+    client.cancel()?;
     group.wait_until_stopped(Duration::from_secs(5))?;
     assert!(
         !response_events(&client.response_body()?)
