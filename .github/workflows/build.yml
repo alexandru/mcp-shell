@@ -89,7 +89,6 @@ jobs:
 
           python3 - <<'PY'
           import ast
-          import plistlib
           import tomllib
           from pathlib import Path
 
@@ -99,14 +98,23 @@ jobs:
           for path in (Path("examples/server.toml"), Path("examples/codex.toml")):
               with path.open("rb") as file:
                   tomllib.load(file)
-
-          with Path("examples/com.example.mcp-shell.plist").open("rb") as file:
-              plistlib.load(file)
           PY
 
           python3 scripts/auth-smoke.py --help >/dev/null
           python3 -B -m unittest discover -s scripts/tests
           bash -n examples/init.bash
+          bash -n install-macos.sh
+
+      - name: Install and validate native macOS service
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          cleanup() {
+            /bin/launchctl bootout "gui/$(/usr/bin/id -u)/io.github.alexandru.mcp-shell" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          /bin/bash install-macos.sh --ref "$GITHUB_REF"
+          python3 scripts/check-macos-install.py
 
   docker:
     name: docker (${{ matrix.platform }})
@@ -261,7 +269,8 @@ jobs:
           mkdir -p "$package_dir"
           cp backend/target/release/mcp-shell "$package_dir/mcp-shell"
           cp -R README.md examples docs scripts "$package_dir/"
-          tar -czf "$RUNNER_TEMP/$archive_name" -C "$package_dir" mcp-shell README.md examples docs scripts
+          cp install-macos.sh "$package_dir/install-macos.sh"
+          tar -czf "$RUNNER_TEMP/$archive_name" -C "$package_dir" mcp-shell README.md examples docs scripts install-macos.sh
           (cd "$RUNNER_TEMP" && shasum -a 256 "$archive_name" > "$archive_name.sha256")
 
       - name: Upload native artifact
