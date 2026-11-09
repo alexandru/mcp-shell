@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf, sync::Arc};
+use std::{io, sync::Arc};
 
 use axum::{
     Router,
@@ -29,11 +29,6 @@ use tokio_util::sync::CancellationToken;
 use crate::{config::Config, execution::Executor, policy};
 
 pub(crate) async fn serve(config: Config) -> Result<(), ServerError> {
-    if let Some(file) = config.initialization_file.as_ref() {
-        return Err(ServerError::InitializationUnsupported(
-            file.path().to_path_buf(),
-        ));
-    }
     let mut interrupt = signal(SignalKind::interrupt()).map_err(ServerError::Signal)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(ServerError::Signal)?;
     let listener = tokio::net::TcpListener::bind(config.bind.get())
@@ -85,8 +80,6 @@ pub(crate) enum ServerError {
     Bind(#[source] io::Error),
     #[error("HTTP server failed")]
     Serve(#[source] io::Error),
-    #[error("initialization files are not supported by the literal-invocation endpoint: {0}")]
-    InitializationUnsupported(PathBuf),
 }
 
 #[derive(Clone)]
@@ -116,7 +109,7 @@ impl ServerHandler for CommandServer {
         schema.insert("additionalProperties".into(), json!(false));
         Ok(ListToolsResult::with_all_items(vec![Tool::new(
             "execute",
-            "Execute one allowed literal command invocation.",
+            "Execute one authorized Bash-compatible shell expression.",
             schema,
         )]))
     }
@@ -134,8 +127,8 @@ impl ServerHandler for CommandServer {
             .ok_or_else(|| McpError::invalid_params("expected command argument", None))?;
         let params: ExecuteParams = serde_json::from_value(Value::Object(arguments))
             .map_err(|_| McpError::invalid_params("expected only a command string", None))?;
-        let invocation = match policy::authorize(&params.command, &self.config.allow_rules) {
-            Ok(invocation) => invocation,
+        let expression = match policy::authorize(&params.command, &self.config.allow_rules) {
+            Ok(expression) => expression,
             Err(error) => return Ok(tool_error(&error.to_string())),
         };
         if let Some(progress_token) = context.meta.get_progress_token() {
@@ -150,7 +143,7 @@ impl ServerHandler for CommandServer {
                     McpError::internal_error("could not start execution response", None)
                 })?;
         }
-        match self.executor.execute(invocation, context.ct).await {
+        match self.executor.execute(expression, context.ct).await {
             Ok(output) => {
                 let succeeded = output.succeeded();
                 let result = serde_json::to_value(output).map_err(|_| {

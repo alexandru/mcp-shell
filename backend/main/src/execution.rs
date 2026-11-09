@@ -1,6 +1,7 @@
 use std::{
+    ffi::OsStr,
     io,
-    os::unix::process::ExitStatusExt,
+    os::unix::{ffi::OsStrExt, process::ExitStatusExt},
     process::{ExitStatus, Stdio},
     sync::{
         Arc,
@@ -24,7 +25,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     config::{Config, OutputLimit},
-    policy::AuthorizedInvocation,
+    policy::AuthorizedExpression,
 };
 
 /// Owns running commands until their cleanup has completed, including after a caller disappears.
@@ -48,7 +49,7 @@ impl Executor {
 
     pub(crate) async fn execute(
         &self,
-        invocation: AuthorizedInvocation,
+        expression: AuthorizedExpression,
         request_cancellation: CancellationToken,
     ) -> Result<ExecutionOutput, ExecutionError> {
         let permit = self
@@ -64,7 +65,7 @@ impl Executor {
         self.tasks
             .spawn(async move {
                 let _permit = permit;
-                run(invocation, config, cancellation, shutdown).await
+                run(expression, config, cancellation, shutdown).await
             })
             .await
             .map_err(ExecutionError::Supervisor)?
@@ -145,10 +146,30 @@ struct ProcessGroup {
 }
 
 impl ProcessGroup {
-    fn start(invocation: &AuthorizedInvocation, config: &Config) -> Result<Self, ExecutionError> {
-        let mut command = Command::new(invocation.program());
+    fn start(expression: &AuthorizedExpression, config: &Config) -> Result<Self, ExecutionError> {
+        let initialization_file = config
+            .initialization_file
+            .as_ref()
+            .map(|file| file.path().as_os_str())
+            .unwrap_or(OsStr::new(""));
+        let mut command = Command::new("/bin/bash");
         command
-            .args(invocation.arguments())
+            .args([
+                "--noprofile",
+                "--norc",
+                "-O",
+                "expand_aliases",
+                "-c",
+                BASH_EXECUTION_WRAPPER,
+                "mcp-shell",
+            ])
+            .arg(initialization_file)
+            .arg(expression.script())
+            .env_clear()
+            .envs(
+                std::env::vars_os()
+                    .filter(|(name, _)| !is_shell_startup_variable(name.as_os_str())),
+            )
             .current_dir(config.working_directory.path())
             .env_remove("MCP_SHELL_TOKEN_SHA256")
             .process_group(0)
@@ -196,7 +217,7 @@ impl Drop for ProcessGroup {
 }
 
 async fn run(
-    invocation: AuthorizedInvocation,
+    expression: AuthorizedExpression,
     config: Arc<Config>,
     cancellation: CancellationToken,
     shutdown: CancellationToken,
@@ -204,7 +225,7 @@ async fn run(
     if cancellation.is_cancelled() || shutdown.is_cancelled() {
         return Err(ExecutionError::Cancelled);
     }
-    let mut group = ProcessGroup::start(&invocation, &config)?;
+    let mut group = ProcessGroup::start(&expression, &config)?;
     let stdout = group
         .child
         .stdout
@@ -241,6 +262,33 @@ async fn run(
             Err(error)
         }
     }
+}
+
+const BASH_EXECUTION_WRAPPER: &str = r#"
+readonly __mcp_shell_initialization_file="$1"
+readonly __mcp_shell_client_expression="$2"
+set --
+if [[ -n "$__mcp_shell_initialization_file" ]]; then
+    builtin source -- "$__mcp_shell_initialization_file"
+    __mcp_shell_initialization_status=$?
+    if (( __mcp_shell_initialization_status != 0 )); then
+        exit "$__mcp_shell_initialization_status"
+    fi
+fi
+builtin eval -- "$__mcp_shell_client_expression"
+"#;
+
+fn is_shell_startup_variable(name: &OsStr) -> bool {
+    let name = name.as_bytes();
+    let shell_startup_variables: &[&[u8]] = &[
+        b"BASH_ENV",
+        b"ENV",
+        b"SHELLOPTS",
+        b"BASHOPTS",
+        b"POSIXLY_CORRECT",
+        b"BASH_COMPAT",
+    ];
+    name.starts_with(b"BASH_FUNC_") || shell_startup_variables.contains(&name)
 }
 
 async fn read_output(
