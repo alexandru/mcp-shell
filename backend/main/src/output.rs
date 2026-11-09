@@ -186,83 +186,56 @@ fn write_output_object(
 fn write_file_json_string(writer: &mut impl Write, file: &mut impl ReadSeek) -> io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
     writer.write_all(b"\"")?;
-    let mut escaped = JsonStringWriter(writer);
-    write_file_lossy_utf8(&mut escaped, file)?;
-    escaped.0.write_all(b"\"")
+    write_file_lossy_utf8(file, |text| write_json_string_fragment(writer, text))?;
+    writer.write_all(b"\"")
 }
 
-fn write_file_lossy_utf8(writer: &mut impl Write, file: &mut impl Read) -> io::Result<()> {
+fn write_file_lossy_utf8(
+    file: &mut impl Read,
+    mut emit: impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<()> {
     let mut read_buffer = [0_u8; CHUNK_SIZE.0];
-    let mut combined = [0_u8; CHUNK_SIZE.0 + UTF8_CARRY_CAPACITY.0];
-    let mut carry = [0_u8; UTF8_CARRY_CAPACITY.0];
-    let mut carry_len = 0;
+    let mut combined = Vec::with_capacity(CHUNK_SIZE.0 + UTF8_CARRY_CAPACITY.0);
+    let mut carry = Vec::new();
 
     loop {
         let count = file.read(&mut read_buffer)?;
         if count == 0 {
-            if carry_len > 0 {
-                writer.write_all("�".as_bytes())?;
+            if !carry.is_empty() {
+                emit("�")?;
             }
             return Ok(());
         }
 
-        let carry_bytes = carry
-            .get(..carry_len)
-            .ok_or_else(|| invalid_message("invalid UTF-8 carry length"))?;
-        combined
-            .get_mut(..carry_len)
-            .ok_or_else(|| invalid_message("invalid UTF-8 carry length"))?
-            .copy_from_slice(carry_bytes);
         let read_bytes = read_buffer
             .get(..count)
             .ok_or_else(|| invalid_message("invalid file read length"))?;
-        let input_end = carry_len
-            .checked_add(count)
-            .ok_or_else(|| invalid_message("file read length overflowed"))?;
-        combined
-            .get_mut(carry_len..input_end)
-            .ok_or_else(|| invalid_message("invalid combined UTF-8 length"))?
-            .copy_from_slice(read_bytes);
-        let mut remaining = combined
-            .get(..input_end)
-            .ok_or_else(|| invalid_message("invalid combined UTF-8 length"))?;
-        carry_len = 0;
+        combined.clear();
+        combined.extend_from_slice(&carry);
+        combined.extend_from_slice(read_bytes);
+        carry.clear();
 
-        loop {
-            match str::from_utf8(remaining) {
-                Ok(text) => {
-                    writer.write_all(text.as_bytes())?;
-                    break;
-                }
-                Err(error) => {
-                    let valid_len = error.valid_up_to();
-                    let valid = remaining
-                        .get(..valid_len)
-                        .ok_or_else(|| invalid_message("invalid UTF-8 prefix length"))?;
-                    writer.write_all(valid)?;
-                    match error.error_len() {
-                        Some(invalid_len) => {
-                            writer.write_all("�".as_bytes())?;
-                            let invalid_end = valid_len
-                                .checked_add(invalid_len)
-                                .ok_or_else(|| invalid_message("invalid UTF-8 error length"))?;
-                            remaining = remaining
-                                .get(invalid_end..)
-                                .ok_or_else(|| invalid_message("invalid UTF-8 error length"))?;
-                        }
-                        None => {
-                            let incomplete = remaining
-                                .get(valid_len..)
-                                .ok_or_else(|| invalid_message("invalid UTF-8 carry length"))?;
-                            carry
-                                .get_mut(..incomplete.len())
-                                .ok_or_else(|| invalid_message("invalid UTF-8 carry length"))?
-                                .copy_from_slice(incomplete);
-                            carry_len = incomplete.len();
-                            break;
-                        }
-                    }
-                }
+        if let Ok(text) = str::from_utf8(&combined) {
+            emit(text)?;
+            continue;
+        }
+
+        let mut chunks = combined.utf8_chunks().peekable();
+        while let Some(chunk) = chunks.next() {
+            emit(chunk.valid())?;
+
+            let invalid = chunk.invalid();
+            if invalid.is_empty() {
+                continue;
+            }
+
+            // A later chunk means this prefix was followed by the byte that broke it.
+            let is_incomplete_tail = chunks.peek().is_none()
+                && matches!(str::from_utf8(invalid), Err(error) if error.error_len().is_none());
+            if is_incomplete_tail {
+                carry.extend_from_slice(invalid);
+            } else {
+                emit("�")?;
             }
         }
     }
@@ -341,44 +314,9 @@ struct JsonStringWriter<'a, W: Write>(&'a mut W);
 
 impl<W: Write> Write for JsonStringWriter<'_, W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        let mut segment_start = 0;
-        for (index, byte) in input.iter().copied().enumerate() {
-            let escape: Option<&[u8]> = match byte {
-                b'"' => Some(b"\\\""),
-                b'\\' => Some(b"\\\\"),
-                0x08 => Some(b"\\b"),
-                b'\t' => Some(b"\\t"),
-                b'\n' => Some(b"\\n"),
-                0x0c => Some(b"\\f"),
-                b'\r' => Some(b"\\r"),
-                0x00..=0x1f => None,
-                _ => continue,
-            };
-            let segment = input
-                .get(segment_start..index)
-                .ok_or_else(|| invalid_message("invalid JSON string segment"))?;
-            self.0.write_all(segment)?;
-            if let Some(escape) = escape {
-                self.0.write_all(escape)?;
-            } else {
-                let escaped = [
-                    b'\\',
-                    b'u',
-                    b'0',
-                    b'0',
-                    hex_digit(byte >> 4)?,
-                    hex_digit(byte & 0x0f)?,
-                ];
-                self.0.write_all(&escaped)?;
-            }
-            segment_start = index
-                .checked_add(1)
-                .ok_or_else(|| invalid_message("JSON string index overflowed"))?;
-        }
-        let segment = input
-            .get(segment_start..)
-            .ok_or_else(|| invalid_message("invalid JSON string segment"))?;
-        self.0.write_all(segment)?;
+        let text = str::from_utf8(input)
+            .map_err(|_| invalid_message("JSON string fragment is not valid UTF-8"))?;
+        write_json_string_fragment(self.0, text)?;
         Ok(input.len())
     }
 
@@ -387,13 +325,26 @@ impl<W: Write> Write for JsonStringWriter<'_, W> {
     }
 }
 
-fn hex_digit(nibble: u8) -> io::Result<u8> {
-    match nibble {
-        0..=9 => Ok(b'0' + nibble),
-        10..=15 => b'a'
-            .checked_add(nibble - 10)
-            .ok_or_else(|| invalid_message("hexadecimal digit overflowed")),
-        _ => Err(invalid_message("invalid hexadecimal digit")),
+fn write_json_string_fragment(writer: &mut impl Write, text: &str) -> io::Result<()> {
+    let mut serializer = serde_json::Serializer::with_formatter(writer, UnquotedStringFormatter);
+    serde::Serializer::serialize_str(&mut serializer, text).map_err(io::Error::from)
+}
+
+struct UnquotedStringFormatter;
+
+impl serde_json::ser::Formatter for UnquotedStringFormatter {
+    fn begin_string<W>(&mut self, _writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + Write,
+    {
+        Ok(())
+    }
+
+    fn end_string<W>(&mut self, _writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + Write,
+    {
+        Ok(())
     }
 }
 

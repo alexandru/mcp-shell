@@ -11,8 +11,11 @@ use tokio::sync::Semaphore;
 
 use crate::{
     execution::{ExecutionOutput, Termination},
-    output::{CHUNK_SIZE, stream},
+    output::{CHUNK_SIZE, JsonStringWriter, stream},
 };
+
+#[derive(Clone, Copy)]
+struct PrefixBytes(usize);
 
 #[tokio::test]
 async fn response_matches_serde_json_for_empty_text_unicode_and_termination()
@@ -42,6 +45,17 @@ async fn response_matches_serde_json_for_empty_text_unicode_and_termination()
             Termination::Signalled { signal: 15 },
             json!({"signal": 15}),
         ),
+        (
+            {
+                let mut bytes = (0_u8..=0x1f).collect::<Vec<_>>();
+                bytes.extend_from_slice(b"\"\\");
+                bytes.extend_from_slice("unicode ✓ 🧪".as_bytes());
+                bytes
+            },
+            Vec::new(),
+            Termination::Exited { exit_code: 0 },
+            json!({"exit_code": 0}),
+        ),
     ];
 
     for (stdout, stderr, termination, expected_termination) in cases {
@@ -51,6 +65,92 @@ async fn response_matches_serde_json_for_empty_text_unicode_and_termination()
     }
 
     Ok(())
+}
+
+#[tokio::test]
+async fn utf8_lossy_decoding_matches_serde_json_across_read_boundaries()
+-> Result<(), Box<dyn Error>> {
+    let prefix_lengths = [
+        PrefixBytes(CHUNK_SIZE.0 - 1),
+        PrefixBytes(CHUNK_SIZE.0 - 2),
+        PrefixBytes(CHUNK_SIZE.0 - 3),
+    ];
+    let valid_sequences: [&[u8]; 3] = [
+        &[0xc2, 0xa2],
+        &[0xe2, 0x9c, 0x93],
+        &[0xf0, 0x9f, 0x92, 0xa9],
+    ];
+    let malformed_sequences: [&[u8]; 6] = [
+        &[0xe2, b'(', 0xa1],
+        &[0xe2, 0x82, b'A'],
+        &[0xed, 0xa0, 0x80],
+        &[0xc0, 0x80],
+        &[0xff],
+        &[0xf4, 0x90, 0x80, 0x80],
+    ];
+    let trailing_incomplete: [&[u8]; 3] = [&[0xe2], &[0xe2, 0x82], &[0xf0, 0x9f, 0x92]];
+    let mut cases = Vec::new();
+
+    for sequence in valid_sequences {
+        for prefix_length in prefix_lengths {
+            let mut bytes = vec![b'a'; prefix_length.0];
+            bytes.extend_from_slice(sequence);
+            bytes.extend_from_slice(b"tail");
+            cases.push(bytes);
+        }
+    }
+    for sequence in malformed_sequences {
+        for prefix_length in prefix_lengths {
+            let mut bytes = vec![b'a'; prefix_length.0];
+            bytes.extend_from_slice(sequence);
+            bytes.extend_from_slice(b"tail");
+            cases.push(bytes);
+        }
+    }
+    for (sequence, prefix_length) in trailing_incomplete.into_iter().zip(prefix_lengths) {
+        let mut bytes = vec![b'a'; prefix_length.0];
+        bytes.extend_from_slice(sequence);
+        cases.push(bytes);
+    }
+
+    assert_eq!(cases.len(), 30);
+    for (index, bytes) in cases.into_iter().enumerate() {
+        let (stdout, stderr) = if index % 2 == 0 {
+            (bytes.as_slice(), &[][..])
+        } else {
+            (&[][..], bytes.as_slice())
+        };
+        let (actual, _) =
+            collect_response(stdout, stderr, Termination::Exited { exit_code: 0 }).await?;
+        let expected = expected_response(stdout, stderr, json!({"exit_code": 0}))?;
+        assert_response_eq(&actual, &expected);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn json_string_writer_preserves_sink_error_kind() {
+    struct FailingWrite(io::ErrorKind);
+
+    impl Write for FailingWrite {
+        fn write(&mut self, _input: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "sink failure sentinel"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut sink = FailingWrite(io::ErrorKind::PermissionDenied);
+    let mut writer = JsonStringWriter(&mut sink);
+    let result = writer.write_all(b"output");
+
+    assert_eq!(
+        result.err().map(|error| error.kind()),
+        Some(io::ErrorKind::PermissionDenied)
+    );
 }
 
 #[tokio::test]

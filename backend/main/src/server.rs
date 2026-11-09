@@ -160,39 +160,38 @@ impl ServerHandler for CommandServer {
             .and_then(|parts| parts.extensions.get::<DeferredOutput>())
             .cloned()
             .ok_or_else(|| McpError::internal_error("missing output delivery context", None))?;
-        let progress_token = context.meta.get_progress_token();
-        if let Some(progress_token) = progress_token.clone() {
+        let execution = self
+            .executor
+            .execute(expression, context.ct, params.timeout_ms);
+        let result = if let Some(progress_token) = context.meta.get_progress_token() {
             context
                 .peer
                 .notify_progress(
-                    ProgressNotificationParam::new(progress_token, 0.0)
+                    ProgressNotificationParam::new(progress_token.clone(), 0.0)
                         .with_message("execution accepted"),
                 )
                 .await
                 .map_err(|_| {
                     McpError::internal_error("could not start execution response", None)
                 })?;
-        }
-        let execution = self
-            .executor
-            .execute(expression, context.ct, params.timeout_ms);
-        tokio::pin!(execution);
-        let started = Instant::now();
-        let mut heartbeat =
-            tokio::time::interval_at(started + PROGRESS_INTERVAL, PROGRESS_INTERVAL);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let result = loop {
-            tokio::select! {
-                result = &mut execution => break result,
-                _ = heartbeat.tick(), if progress_token.is_some() => {
-                    if let Some(token) = progress_token.clone() {
+            tokio::pin!(execution);
+            let started = Instant::now();
+            let mut heartbeat =
+                tokio::time::interval_at(started + PROGRESS_INTERVAL, PROGRESS_INTERVAL);
+            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    result = &mut execution => break result,
+                    _ = heartbeat.tick() => {
                         context.peer.notify_progress(
-                            ProgressNotificationParam::new(token, started.elapsed().as_secs_f64())
+                            ProgressNotificationParam::new(progress_token.clone(), started.elapsed().as_secs_f64())
                                 .with_message("execution running"),
                         ).await.map_err(|_| McpError::internal_error("could not report execution progress", None))?;
                     }
                 }
             }
+        } else {
+            execution.await
         };
         match result {
             Ok(output) => {

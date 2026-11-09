@@ -14,7 +14,6 @@ use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
-use serde::Serialize;
 use thiserror::Error;
 use tokio::{
     fs::File,
@@ -130,8 +129,6 @@ pub(crate) enum ExecutionError {
 type ExitCode = i32;
 type SignalNumber = i32;
 
-#[derive(Serialize)]
-#[serde(untagged)]
 pub(crate) enum Termination {
     Exited { exit_code: ExitCode },
     Signalled { signal: SignalNumber },
