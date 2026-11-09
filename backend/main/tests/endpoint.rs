@@ -1,10 +1,10 @@
 use std::{
     error::Error,
-    fs,
+    fs::{self, File},
     io::{self, BufRead, BufReader},
     net::{Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
-    process::{Child, ChildStderr, Command, Stdio},
+    process::{Child, ChildStderr, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -25,14 +25,16 @@ bind = "127.0.0.1:{port}"
 allowed_hosts = {allowed_hosts}
 allowed_origins = {allowed_origins}
 allow_rules = {allow_rules}
-max_runtime_ms = 5000
-max_output_bytes = 1048576
+max_runtime_ms = {max_runtime_ms}
+max_output_bytes = {max_output_bytes}
 max_concurrent = {max_concurrent}
 {optional_config}
 "#;
 const DEFAULT_ALLOW_RULES: &[&str] = &["/usr/bin/printf *", "/bin/echo *", "/usr/bin/false *"];
 const DEFAULT_ALLOWED_HOSTS: &[&str] = &["127.0.0.1"];
 const DEFAULT_MAX_CONCURRENT: ExecutionConcurrency = 4;
+const DEFAULT_RUNTIME_LIMIT: RuntimeMilliseconds = RuntimeMilliseconds(5_000);
+const DEFAULT_OUTPUT_LIMIT: OutputBytes = OutputBytes(1_048_576);
 
 static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(0);
@@ -40,6 +42,12 @@ static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(0);
 type HttpStatusCode = u16;
 type ExecutionConcurrency = usize;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[derive(Clone, Copy)]
+struct RuntimeMilliseconds(u64);
+
+#[derive(Clone, Copy)]
+struct OutputBytes(usize);
 
 #[derive(Clone, Copy)]
 struct FixtureFile<'a> {
@@ -65,6 +73,8 @@ struct ServerOptions<'a> {
     allowed_origins: &'a [&'a str],
     allow_rules: Option<&'a [&'a str]>,
     max_concurrent: Option<ExecutionConcurrency>,
+    max_runtime_ms: Option<RuntimeMilliseconds>,
+    max_output_bytes: Option<OutputBytes>,
     initialization_file: Option<FixtureFile<'a>>,
     additional_files: &'a [FixtureFile<'a>],
     working_directory: Option<&'a str>,
@@ -137,6 +147,25 @@ struct ChildGuard {
 }
 
 impl ChildGuard {
+    fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::other("server-exit deadline overflowed"))?;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.stopped = true;
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "server did not exit within the bounded wait",
+                ));
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn stop(&mut self) -> io::Result<()> {
         if self.stopped {
             return Ok(());
@@ -209,6 +238,8 @@ impl ServerFixture {
         let allow_rules =
             serde_json::to_string(options.allow_rules.unwrap_or(DEFAULT_ALLOW_RULES))?;
         let max_concurrent = options.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
+        let max_runtime_ms = options.max_runtime_ms.unwrap_or(DEFAULT_RUNTIME_LIMIT);
+        let max_output_bytes = options.max_output_bytes.unwrap_or(DEFAULT_OUTPUT_LIMIT);
         let mut optional_config = String::new();
         if let Some(path) = initialization_file.as_deref() {
             append_config_path(&mut optional_config, "initialization_file", path)?;
@@ -221,6 +252,8 @@ impl ServerFixture {
             .replace("{allowed_hosts}", &allowed_hosts)
             .replace("{allowed_origins}", &allowed_origins)
             .replace("{allow_rules}", &allow_rules)
+            .replace("{max_runtime_ms}", &max_runtime_ms.0.to_string())
+            .replace("{max_output_bytes}", &max_output_bytes.0.to_string())
             .replace("{max_concurrent}", &max_concurrent.to_string())
             .replace("{optional_config}", &optional_config);
         fs::write(&config_path, config)?;
@@ -385,6 +418,27 @@ impl ServerFixture {
 
     fn stop(&mut self) -> io::Result<()> {
         self.child.stop()?;
+        self.join_stderr_reader()
+    }
+
+    fn terminate_gracefully(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let process_id = self.child.child.id();
+        if process_id == 0 {
+            return Err(io::Error::other("server process id was not positive"));
+        }
+        let process_id = process_id.to_string();
+        let signal = Command::new("/bin/kill")
+            .args(["-TERM", process_id.as_str()])
+            .status()?;
+        if !signal.success() {
+            return Err(io::Error::other("could not send SIGTERM to the server"));
+        }
+        let status = self.child.wait_for_exit(timeout)?;
+        self.join_stderr_reader()?;
+        Ok(status)
+    }
+
+    fn join_stderr_reader(&mut self) -> io::Result<()> {
         if let Some(reader) = self.stderr_reader.take() {
             reader
                 .join()
@@ -411,6 +465,391 @@ impl Drop for ServerFixture {
 struct HttpResponse {
     status: HttpStatusCode,
     body: String,
+}
+
+#[derive(Clone, Copy)]
+struct ClientTimeoutSeconds(u64);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProcessId(u32);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProcessGroupId(u32);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProcessCount(usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessMarkerCount(usize);
+
+#[derive(Clone, Copy)]
+struct ProcessGroupIdentity {
+    shell_process_id: ProcessId,
+    process_group_id: ProcessGroupId,
+}
+
+struct ProcessSnapshotEntry {
+    process_id: ProcessId,
+    process_group_id: ProcessGroupId,
+    live: bool,
+}
+
+#[derive(Default)]
+struct ProcessGroupGuard {
+    identity: Option<ProcessGroupIdentity>,
+    marker_watch: Option<(PathBuf, ProcessMarkerCount)>,
+}
+
+impl ProcessGroupGuard {
+    fn watch_marker(&mut self, path: &Path, previous_count: ProcessMarkerCount) {
+        self.marker_watch = Some((path.to_path_buf(), previous_count));
+    }
+
+    fn register_shell(&mut self, process_id: ProcessId) {
+        self.identity = Some(ProcessGroupIdentity {
+            shell_process_id: process_id,
+            process_group_id: ProcessGroupId(process_id.0),
+        });
+    }
+
+    fn identity(&self) -> io::Result<ProcessGroupIdentity> {
+        self.identity
+            .ok_or_else(|| io::Error::other("shell process group was not registered"))
+    }
+
+    fn wait_until_stopped(&mut self, timeout: Duration) -> io::Result<()> {
+        wait_for_process_group_stopped(self.identity()?, timeout)?;
+        self.identity = None;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> io::Result<()> {
+        if self.identity.is_none()
+            && let Some((path, previous_count)) = self.marker_watch.as_ref()
+            && process_id_marker_count(path)?.0 > previous_count.0
+            && let Some(process_id) = read_process_id_marker(path)?
+        {
+            self.register_shell(process_id);
+        }
+        let Some(identity) = self.identity else {
+            return Ok(());
+        };
+        signal_process_group(identity.process_group_id)?;
+        wait_for_process_group_stopped(identity, Duration::from_secs(3))?;
+        self.identity = None;
+        Ok(())
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+struct CurlClient {
+    child: Child,
+    response_path: PathBuf,
+    status_path: PathBuf,
+    header_path: PathBuf,
+    finished: bool,
+}
+
+impl CurlClient {
+    fn start(
+        server: &ServerFixture,
+        body: &str,
+        timeout: ClientTimeoutSeconds,
+    ) -> TestResult<Self> {
+        let response_id = NEXT_RESPONSE_ID.fetch_add(1, Ordering::Relaxed);
+        let response_path = server
+            .directory
+            .path
+            .join(format!("async-response-{response_id}.body"));
+        let status_path = server
+            .directory
+            .path
+            .join(format!("async-response-{response_id}.status"));
+        let header_path = server
+            .directory
+            .path
+            .join(format!("async-response-{response_id}.headers"));
+        let status_file = File::create(&status_path)?;
+        let max_time = timeout.0.to_string();
+        let mut curl = Command::new("curl");
+        curl.args([
+            "--silent",
+            "--show-error",
+            "--no-buffer",
+            "--http1.1",
+            "--max-time",
+            max_time.as_str(),
+            "--request",
+            "POST",
+            "--header",
+            "Content-Type: application/json",
+            "--header",
+            "Accept: application/json, text/event-stream",
+            "--header",
+            "MCP-Protocol-Version: 2026-07-28",
+        ])
+        .arg("--header")
+        .arg(format!("Host: 127.0.0.1:{}", server.address.port()))
+        .arg("--header")
+        .arg("Mcp-Method: tools/call")
+        .arg("--header")
+        .arg("Mcp-Name: execute")
+        .arg("--header")
+        .arg(format!("Authorization: Bearer {TOKEN}"))
+        .arg("--dump-header")
+        .arg(&header_path)
+        .arg("--data-binary")
+        .arg(body)
+        .arg("--output")
+        .arg(&response_path)
+        .arg("--write-out")
+        .arg("%{http_code}")
+        .arg(format!("http://{}/mcp", server.address))
+        .stdout(Stdio::from(status_file))
+        .stderr(Stdio::null());
+        let child = curl.spawn()?;
+
+        Ok(Self {
+            child,
+            response_path,
+            status_path,
+            header_path,
+            finished: false,
+        })
+    }
+
+    fn response_body(&self) -> io::Result<String> {
+        match fs::read_to_string(&self.response_path) {
+            Ok(body) => Ok(body),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::other("curl wait deadline overflowed"))?;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.finished = true;
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "curl did not exit within the bounded wait",
+                ));
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn cancel(&mut self) -> io::Result<()> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+        }
+        self.child.wait()?;
+        self.finished = true;
+        Ok(())
+    }
+
+    fn completed_response(&mut self, timeout: Duration) -> io::Result<HttpResponse> {
+        let status = self.wait_for_exit(timeout)?;
+        if !status.success() {
+            return Err(io::Error::other(format!("curl exited with {status}")));
+        }
+        let status_text = fs::read_to_string(&self.status_path)?;
+        let status = status_text
+            .trim()
+            .parse::<HttpStatusCode>()
+            .map_err(io::Error::other)?;
+        let body = fs::read_to_string(&self.response_path)?;
+        Ok(HttpResponse { status, body })
+    }
+}
+
+impl Drop for CurlClient {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.cancel();
+        }
+        let _ = fs::remove_file(&self.response_path);
+        let _ = fs::remove_file(&self.status_path);
+        let _ = fs::remove_file(&self.header_path);
+    }
+}
+
+fn process_snapshot() -> io::Result<Vec<ProcessSnapshotEntry>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,pgid=,stat="])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("ps could not inspect process groups"));
+    }
+    let output = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(process_id) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(process_group_id) = fields.next().and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        if process_id == 0 || process_group_id == 0 {
+            continue;
+        }
+        entries.push(ProcessSnapshotEntry {
+            process_id: ProcessId(process_id),
+            process_group_id: ProcessGroupId(process_group_id),
+            live: !state.contains('Z'),
+        });
+    }
+    Ok(entries)
+}
+
+fn wait_for_running_pipeline(
+    pid_marker: &Path,
+    previous_marker_count: ProcessMarkerCount,
+    minimum_live_members: ProcessCount,
+    timeout: Duration,
+    guard: &mut ProcessGroupGuard,
+) -> io::Result<ProcessGroupIdentity> {
+    guard.watch_marker(pid_marker, previous_marker_count);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("process-group readiness deadline overflowed"))?;
+    loop {
+        if process_id_marker_count(pid_marker)?.0 > previous_marker_count.0
+            && let Some(process_id) = read_process_id_marker(pid_marker)?
+        {
+            guard.register_shell(process_id);
+            let identity = guard.identity()?;
+            let snapshot = process_snapshot()?;
+            let shell_is_running = snapshot.iter().any(|entry| {
+                entry.process_id == identity.shell_process_id
+                    && entry.process_group_id == identity.process_group_id
+                    && entry.live
+            });
+            let live_members = snapshot
+                .iter()
+                .filter(|entry| entry.process_group_id == identity.process_group_id && entry.live)
+                .count();
+            if shell_is_running && live_members >= minimum_live_members.0 {
+                return Ok(identity);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "shell pipeline did not reach the required live process count",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn process_id_marker_count(path: &Path) -> io::Result<ProcessMarkerCount> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ProcessMarkerCount(0));
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(ProcessMarkerCount(
+        contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+    ))
+}
+
+fn wait_for_new_process_id_marker(
+    path: &Path,
+    previous_count: ProcessMarkerCount,
+    timeout: Duration,
+) -> io::Result<Option<ProcessId>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("process marker deadline overflowed"))?;
+    loop {
+        if process_id_marker_count(path)?.0 > previous_count.0 {
+            return read_process_id_marker(path);
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn read_process_id_marker(path: &Path) -> io::Result<Option<ProcessId>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(last_line) = contents.lines().rfind(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let process_id = last_line.trim().parse::<u32>().map_err(io::Error::other)?;
+    if process_id == 0 {
+        return Err(io::Error::other("shell process id marker was not positive"));
+    }
+    Ok(Some(ProcessId(process_id)))
+}
+
+fn wait_for_process_group_stopped(
+    identity: ProcessGroupIdentity,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("process-group cleanup deadline overflowed"))?;
+    loop {
+        let snapshot = process_snapshot()?;
+        let shell_present = snapshot
+            .iter()
+            .any(|entry| entry.process_id == identity.shell_process_id);
+        let group_members_remain = snapshot
+            .iter()
+            .any(|entry| entry.process_group_id == identity.process_group_id);
+        if !shell_present && !group_members_remain {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "shell process group remained after cancellation",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn signal_process_group(process_group_id: ProcessGroupId) -> io::Result<()> {
+    let process_group = process_group_id.0.to_string();
+    let status = Command::new("pkill")
+        .args(["-KILL", "-g", process_group.as_str()])
+        .status()?;
+    if status.success() || status.code() == Some(1) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "pkill exited with {status} while stopping process group"
+        )))
+    }
 }
 
 impl HttpResponse {
@@ -479,14 +918,21 @@ fn forward_stderr(
 }
 
 fn request_metadata() -> Value {
+    let mut metadata = client_metadata();
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("progressToken".into(), json!("mcp-shell-integration-test"));
+    }
+    metadata
+}
+
+fn client_metadata() -> Value {
     json!({
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
         "io.modelcontextprotocol/clientInfo": {
             "name": "mcp-shell-integration-test",
             "version": "0.1.0"
         },
-        "io.modelcontextprotocol/clientCapabilities": {},
-        "progressToken": "mcp-shell-integration-test"
+        "io.modelcontextprotocol/clientCapabilities": {}
     })
 }
 
@@ -501,6 +947,10 @@ fn tools_list_body() -> String {
 }
 
 fn tool_call_body(arguments: Value) -> String {
+    tool_call_body_with_metadata(arguments, request_metadata())
+}
+
+fn tool_call_body_with_metadata(arguments: Value, metadata: Value) -> String {
     json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -508,7 +958,7 @@ fn tool_call_body(arguments: Value) -> String {
         "params": {
             "name": "execute",
             "arguments": arguments,
-            "_meta": request_metadata()
+            "_meta": metadata
         }
     })
     .to_string()
@@ -544,6 +994,127 @@ fn assert_policy_rejected_before_execution(
     assert_eq!(message.pointer("/result/structuredContent/exit_code"), None);
     assert!(!side_effect.exists());
     Ok(())
+}
+
+const EXECUTION_ALLOW_RULES: &[&str] = &[
+    "/bin/sleep *",
+    "/bin/cat *",
+    "/usr/bin/printf *",
+    "/usr/bin/yes *",
+    "/usr/bin/tee *",
+];
+const PROCESS_ID_INITIALIZATION: FixtureFile<'static> = FixtureFile {
+    relative_path: "trusted process marker init.bash",
+    contents: "builtin printf '%s\\n' \"$$\" >> 'shell pid markers.txt'\n",
+};
+const PROCESS_MARKER_DIRECTORY: &str = "working directory";
+const PROCESS_MARKER_NAME: &str = "shell pid markers.txt";
+
+fn start_execution_server(
+    max_concurrent: ExecutionConcurrency,
+    max_runtime_ms: RuntimeMilliseconds,
+    max_output_bytes: OutputBytes,
+) -> TestResult<ServerFixture> {
+    ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(EXECUTION_ALLOW_RULES),
+        max_concurrent: Some(max_concurrent),
+        max_runtime_ms: Some(max_runtime_ms),
+        max_output_bytes: Some(max_output_bytes),
+        initialization_file: Some(PROCESS_ID_INITIALIZATION),
+        working_directory: Some(PROCESS_MARKER_DIRECTORY),
+        ..ServerOptions::default()
+    })
+}
+
+fn process_marker_path(server: &ServerFixture) -> PathBuf {
+    server
+        .directory
+        .path
+        .join(PROCESS_MARKER_DIRECTORY)
+        .join(PROCESS_MARKER_NAME)
+}
+
+fn execution_body(
+    command: &str,
+    timeout_ms: Option<Value>,
+    include_progress_token: bool,
+) -> String {
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("command".into(), json!(command));
+    if let Some(timeout_ms) = timeout_ms {
+        arguments.insert("timeout_ms".into(), timeout_ms);
+    }
+    let metadata = if include_progress_token {
+        request_metadata()
+    } else {
+        client_metadata()
+    };
+    tool_call_body_with_metadata(Value::Object(arguments), metadata)
+}
+
+fn assert_tool_error_without_output(
+    response: &HttpResponse,
+    expected_error: Option<&str>,
+) -> io::Result<()> {
+    assert_eq!(response.status, 200);
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(true)
+    );
+    let actual_error = message
+        .pointer("/result/structuredContent/error")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("tool error response did not include an error"))?;
+    if let Some(expected_error) = expected_error {
+        assert_eq!(actual_error, expected_error);
+    }
+    assert_eq!(message.pointer("/result/structuredContent/stdout"), None);
+    Ok(())
+}
+
+fn assert_successful_stdout(response: &HttpResponse, expected_stdout: &str) -> io::Result<()> {
+    assert_eq!(response.status, 200);
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message.pointer("/result/isError").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some(expected_stdout)
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    Ok(())
+}
+
+fn wait_for_response_body(
+    client: &CurlClient,
+    expected: &str,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("response-body deadline overflowed"))?;
+    loop {
+        if client.response_body()?.contains(expected) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "expected response body event did not arrive",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]
@@ -1540,7 +2111,8 @@ report_env() { printf '%s|%s|%s\n' "$HOME" "$PATH" "$MCP_TEST_AUTH"; }
             .and_then(Value::as_bool),
         Some(false)
     );
-    let expected_working_directory = server.directory.path.join("working directory with spaces");
+    let expected_working_directory =
+        fs::canonicalize(server.directory.path.join("working directory with spaces"))?;
     let expected_working_directory = expected_working_directory.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1665,5 +2237,270 @@ fn strips_inherited_shell_hooks_and_keeps_configured_initialization() -> TestRes
             .join("printf function marker.txt")
             .exists()
     );
+    Ok(())
+}
+
+#[test]
+fn cancels_disconnected_clients_before_response_and_after_progress_event() -> TestResult {
+    let server = start_execution_server(1, RuntimeMilliseconds(30_000), DEFAULT_OUTPUT_LIMIT)?;
+    let marker = process_marker_path(&server);
+    let before_response_marker_count = process_id_marker_count(&marker)?;
+    let mut before_response = CurlClient::start(
+        &server,
+        &execution_body("/bin/sleep 30 | /bin/cat", None, false),
+        ClientTimeoutSeconds(20),
+    )?;
+    let mut before_response_group = ProcessGroupGuard::default();
+    wait_for_running_pipeline(
+        &marker,
+        before_response_marker_count,
+        ProcessCount(3),
+        Duration::from_secs(5),
+        &mut before_response_group,
+    )?;
+    let response_body = before_response.response_body()?;
+    assert!(
+        !response_body.contains("data:") && !response_body.contains("\"jsonrpc\""),
+        "a response arrived before the no-progress command completed"
+    );
+    before_response.cancel()?;
+    before_response_group.wait_until_stopped(Duration::from_secs(5))?;
+
+    let after_progress_marker_count = process_id_marker_count(&marker)?;
+    let mut after_progress = CurlClient::start(
+        &server,
+        &execution_body("/bin/sleep 30 | /bin/cat", None, true),
+        ClientTimeoutSeconds(20),
+    )?;
+    wait_for_response_body(
+        &after_progress,
+        "notifications/progress",
+        Duration::from_secs(5),
+    )?;
+    let mut after_progress_group = ProcessGroupGuard::default();
+    wait_for_running_pipeline(
+        &marker,
+        after_progress_marker_count,
+        ProcessCount(3),
+        Duration::from_secs(5),
+        &mut after_progress_group,
+    )?;
+    after_progress.cancel()?;
+    after_progress_group.wait_until_stopped(Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn curl_timeout_cancels_a_live_pipeline() -> TestResult {
+    let server = start_execution_server(1, RuntimeMilliseconds(30_000), DEFAULT_OUTPUT_LIMIT)?;
+    let marker = process_marker_path(&server);
+    let previous_marker_count = process_id_marker_count(&marker)?;
+    let mut client = CurlClient::start(
+        &server,
+        &execution_body("/bin/sleep 30 | /bin/cat", None, false),
+        ClientTimeoutSeconds(6),
+    )?;
+    let mut group = ProcessGroupGuard::default();
+    wait_for_running_pipeline(
+        &marker,
+        previous_marker_count,
+        ProcessCount(3),
+        Duration::from_secs(5),
+        &mut group,
+    )?;
+    let client_status = client.wait_for_exit(Duration::from_secs(10))?;
+    assert_eq!(client_status.code(), Some(28));
+    group.wait_until_stopped(Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
+fn request_timeouts_are_validated_and_capped_by_server_runtime() -> TestResult {
+    let server = start_execution_server(1, RuntimeMilliseconds(6_000), DEFAULT_OUTPUT_LIMIT)?;
+    let marker = process_marker_path(&server);
+
+    let short_timeout_marker_count = process_id_marker_count(&marker)?;
+    let mut short_timeout = CurlClient::start(
+        &server,
+        &execution_body("/bin/sleep 30 | /bin/cat", Some(json!(2_000)), false),
+        ClientTimeoutSeconds(15),
+    )?;
+    let mut short_timeout_group = ProcessGroupGuard::default();
+    wait_for_running_pipeline(
+        &marker,
+        short_timeout_marker_count,
+        ProcessCount(3),
+        Duration::from_secs(5),
+        &mut short_timeout_group,
+    )?;
+    let short_timeout_response = short_timeout.completed_response(Duration::from_secs(3))?;
+    assert_tool_error_without_output(&short_timeout_response, Some("command execution timed out"))?;
+    short_timeout_group.wait_until_stopped(Duration::from_secs(5))?;
+
+    let capped_timeout_marker_count = process_id_marker_count(&marker)?;
+    let mut capped_timeout = CurlClient::start(
+        &server,
+        &execution_body("/bin/sleep 30 | /bin/cat", Some(json!(86_400_000)), false),
+        ClientTimeoutSeconds(15),
+    )?;
+    let mut capped_timeout_group = ProcessGroupGuard::default();
+    wait_for_running_pipeline(
+        &marker,
+        capped_timeout_marker_count,
+        ProcessCount(3),
+        Duration::from_secs(5),
+        &mut capped_timeout_group,
+    )?;
+    let capped_timeout_response = capped_timeout.completed_response(Duration::from_secs(10))?;
+    assert_tool_error_without_output(
+        &capped_timeout_response,
+        Some("command execution timed out"),
+    )?;
+    capped_timeout_group.wait_until_stopped(Duration::from_secs(5))?;
+
+    let marker_count_before_invalid_timeouts = process_id_marker_count(&marker)?;
+    for timeout_ms in [json!(0), json!(-1), json!(1.5)] {
+        let invalid_timeout = server.post(
+            "tools/call",
+            Some("execute"),
+            &execution_body("/bin/sleep 30", Some(timeout_ms), false),
+            Some(TOKEN),
+            "127.0.0.1",
+            None,
+        )?;
+        assert_invalid_params(&invalid_timeout)?;
+        assert_eq!(
+            process_id_marker_count(&marker)?,
+            marker_count_before_invalid_timeouts
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn output_overflow_stops_stdout_stderr_and_combined_output_and_releases_capacity() -> TestResult {
+    let server = start_execution_server(1, RuntimeMilliseconds(30_000), OutputBytes(128))?;
+    let marker = process_marker_path(&server);
+    let commands = [
+        "/usr/bin/yes x",
+        "/usr/bin/yes x 1>&2",
+        "/usr/bin/printf '%080d' 0; /usr/bin/printf '%080d' 0 1>&2",
+    ];
+
+    for command in commands {
+        let previous_marker_count = process_id_marker_count(&marker)?;
+        let mut group = ProcessGroupGuard::default();
+        group.watch_marker(&marker, previous_marker_count);
+        let overflow = server.post(
+            "tools/call",
+            Some("execute"),
+            &execution_body(command, None, false),
+            Some(TOKEN),
+            "127.0.0.1",
+            None,
+        )?;
+        assert_tool_error_without_output(&overflow, Some("command output limit exceeded"))?;
+
+        let process_id =
+            wait_for_new_process_id_marker(&marker, previous_marker_count, Duration::from_secs(2))?
+                .ok_or_else(|| {
+                    io::Error::other("overflowing command did not write its process marker")
+                })?;
+        group.register_shell(process_id);
+        group.wait_until_stopped(Duration::from_secs(5))?;
+
+        let control = server.post(
+            "tools/call",
+            Some("execute"),
+            &execution_body("/usr/bin/printf %s recovered", None, false),
+            Some(TOKEN),
+            "127.0.0.1",
+            None,
+        )?;
+        assert_successful_stdout(&control, "recovered")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn client_cancellation_releases_single_execution_capacity() -> TestResult {
+    let server = start_execution_server(1, RuntimeMilliseconds(30_000), DEFAULT_OUTPUT_LIMIT)?;
+    let marker = process_marker_path(&server);
+    let previous_marker_count = process_id_marker_count(&marker)?;
+    let mut client = CurlClient::start(
+        &server,
+        &execution_body("/bin/sleep 30 | /bin/cat", None, false),
+        ClientTimeoutSeconds(20),
+    )?;
+    let mut group = ProcessGroupGuard::default();
+    wait_for_running_pipeline(
+        &marker,
+        previous_marker_count,
+        ProcessCount(3),
+        Duration::from_secs(5),
+        &mut group,
+    )?;
+
+    let busy = server.post(
+        "tools/call",
+        Some("execute"),
+        &execution_body("/usr/bin/printf %s busy", None, false),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_tool_error_without_output(&busy, Some("execution capacity is exhausted"))?;
+    assert_eq!(
+        process_id_marker_count(&marker)?,
+        ProcessMarkerCount(previous_marker_count.0 + 1)
+    );
+
+    client.cancel()?;
+    group.wait_until_stopped(Duration::from_secs(5))?;
+    let recovered = server.post(
+        "tools/call",
+        Some("execute"),
+        &execution_body("/usr/bin/printf %s recovered", None, false),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_successful_stdout(&recovered, "recovered")?;
+    Ok(())
+}
+
+#[test]
+fn sigterm_shutdown_reaps_an_active_pipeline() -> TestResult {
+    let mut server = start_execution_server(1, RuntimeMilliseconds(30_000), DEFAULT_OUTPUT_LIMIT)?;
+    let control = server.post(
+        "tools/call",
+        Some("execute"),
+        &execution_body("/usr/bin/printf %s ready", None, false),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    assert_successful_stdout(&control, "ready")?;
+
+    let marker = process_marker_path(&server);
+    let previous_marker_count = process_id_marker_count(&marker)?;
+    let mut client = CurlClient::start(
+        &server,
+        &execution_body("/bin/sleep 30 | /bin/cat", None, false),
+        ClientTimeoutSeconds(20),
+    )?;
+    let mut group = ProcessGroupGuard::default();
+    wait_for_running_pipeline(
+        &marker,
+        previous_marker_count,
+        ProcessCount(3),
+        Duration::from_secs(5),
+        &mut group,
+    )?;
+
+    let server_status = server.terminate_gracefully(Duration::from_secs(5))?;
+    assert_eq!(server_status.code(), Some(0));
+    group.wait_until_stopped(Duration::from_secs(5))?;
+    let _client_status = client.wait_for_exit(Duration::from_secs(5))?;
     Ok(())
 }

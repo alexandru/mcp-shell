@@ -24,7 +24,7 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    config::{Config, OutputLimit},
+    config::{Config, OutputLimit, RuntimeLimit},
     policy::AuthorizedExpression,
 };
 
@@ -51,6 +51,7 @@ impl Executor {
         &self,
         expression: AuthorizedExpression,
         request_cancellation: CancellationToken,
+        requested_runtime: Option<RuntimeLimit>,
     ) -> Result<ExecutionOutput, ExecutionError> {
         let permit = self
             .permits
@@ -62,10 +63,13 @@ impl Executor {
         let _cancel_on_drop = cancellation.clone().drop_guard();
         let config = self.config.clone();
         let shutdown = self.shutdown.clone();
+        let runtime = requested_runtime.map_or(config.max_runtime_ms, |requested| {
+            requested.min(config.max_runtime_ms)
+        });
         self.tasks
             .spawn(async move {
                 let _permit = permit;
-                run(expression, config, cancellation, shutdown).await
+                run(expression, config, cancellation, shutdown, runtime).await
             })
             .await
             .map_err(ExecutionError::Supervisor)?
@@ -205,6 +209,12 @@ impl ProcessGroup {
             self.child.start_kill().map_err(ExecutionError::Wait)?;
         }
         self.child.wait().await.map_err(ExecutionError::Wait)?;
+        // Darwin can return EPERM for a group containing only zombies. Reaping our
+        // child can remove that group; a persistent permission error must still fail.
+        let signalled = match signalled {
+            Err(ExecutionError::Signal(Errno::EPERM)) => self.signal(),
+            result => result,
+        };
         self.identity = None;
         signalled
     }
@@ -221,6 +231,7 @@ async fn run(
     config: Arc<Config>,
     cancellation: CancellationToken,
     shutdown: CancellationToken,
+    runtime: RuntimeLimit,
 ) -> Result<ExecutionOutput, ExecutionError> {
     if cancellation.is_cancelled() || shutdown.is_cancelled() {
         return Err(ExecutionError::Cancelled);
@@ -249,7 +260,7 @@ async fn run(
             result = collect => result,
             _ = cancellation.cancelled() => Err(ExecutionError::Cancelled),
             _ = shutdown.cancelled() => Err(ExecutionError::Cancelled),
-            _ = tokio::time::sleep(config.max_runtime_ms.duration()) => Err(ExecutionError::Timeout),
+            _ = tokio::time::sleep(runtime.duration()) => Err(ExecutionError::Timeout),
         }
     };
     match result {
@@ -275,6 +286,7 @@ if [[ -n "$__mcp_shell_initialization_file" ]]; then
         exit "$__mcp_shell_initialization_status"
     fi
 fi
+builtin set +m
 builtin eval -- "$__mcp_shell_client_expression"
 "#;
 
@@ -329,3 +341,7 @@ fn output(
         termination: Termination::try_from(status)?,
     })
 }
+
+#[cfg(test)]
+#[path = "../unit-tests/execution.rs"]
+mod tests;
