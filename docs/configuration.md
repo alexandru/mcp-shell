@@ -1,148 +1,145 @@
 # Configuration
 
-The macOS and Ubuntu installers write `~/.config/mcp-shell/server.toml` and
-`~/.config/mcp-shell/init.bash`. They preserve those files when run again. The
-server must run as an operating-system user who has the allowed CLI tools
-installed and authenticated.
-
-After startup, run an allowed read-only command through the server to verify the
-CLI authentication from its actual launch context.
+The installers create `~/.config/mcp-shell/server.toml` and `init.bash`.
+Later installs preserve both files. The server runs as the host user, the account that executes commands.
+Install and authenticate the allowed CLI tools as that user.
+After startup, execute an allowed read-only command through mcp-shell to make sure that authentication works.
 
 ## Server settings
 
-The file is TOML. Unknown fields are rejected.
+The configuration uses TOML. The server rejects unknown fields.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `bind` | `127.0.0.1:8090` | HTTP listen address. |
-| `allowed_hosts` | Bind authority, `localhost:<port>`, and `host.docker.internal:<port>` | Accepted HTTP `Host` authorities. Set this when using another proxy hostname. |
-| `allowed_origins` | `[]` | Allowed browser origins. Requests without an `Origin` header are accepted. |
-| `allow_rules` | `[]` | Command patterns. An empty list denies every command. |
-| `max_runtime_ms` | `60000` | Maximum request runtime, from 1 to 86400000 ms. |
-| `max_output_bytes` | Omitted | Optional combined stdout and stderr limit in bytes; when set, it must be positive. |
-| `max_concurrent` | `4` | Maximum requests capturing or delivering output at once; must be positive. Excess requests return busy instead of waiting. |
-| `initialization_file` | Omitted | Optional absolute path to an existing regular file. |
-| `working_directory` | Server's current directory | Optional absolute path to an existing directory. |
+| `bind` | `127.0.0.1:8090` | HTTP listen address. The macOS installer sets `0.0.0.0:8090` for Docker access. |
+| `allowed_hosts` | Bind address, `localhost:<port>`, and `host.docker.internal:<port>` | Accepted HTTP `Host` names and ports. |
+| `allowed_origins` | `[]` | Accepted browser origins. Requests without `Origin` are accepted. |
+| `allow_rules` | `[]` | Permitted command patterns. An empty list denies all commands. |
+| `description` | Omitted | Optional nonempty text that tells the agent when to use the `execute` tool. |
+| `max_runtime_ms` | `60000` | Maximum execution time, from 1 to 86400000 milliseconds. |
+| `max_output_bytes` | Omitted | Optional combined limit for stdout and stderr. Must be positive. |
+| `max_concurrent` | `4` | Maximum requests that capture or deliver output at once. Must be positive. Excess requests return busy. |
+| `initialization_file` | Omitted | Absolute path to an existing regular file with shell setup commands. |
+| `working_directory` | Current server directory | Absolute path to an existing directory for command execution. |
 
-`allowed_hosts` must contain at least one authority. `allowed_origins` values
-must use `http://` or `https://`. Add only the hostname and port that the
-client sends in `Host`; for example, `host.docker.internal:8443` for the local
-Caddy setup.
+`allowed_hosts` must contain at least one name and port, such as `host.docker.internal:8090`.
+Use the name and port that the client sends in `Host`.
+Each `allowed_origins` value must start with `http://` or `https://`.
 
-The macOS installer starts with `gh *` and `az *` rules. These allow every
-invocation of those CLIs. The example [server.toml](../examples/server.toml)
-shows narrower rules for viewing a GitHub pull request, listing Azure DevOps
-projects, and using `head`. Change the rules to match the commands you need.
-Patterns use shell-quoted words. `*` is the only wildcard and can match across
-arguments; a trailing ` *` also matches an invocation with no extra arguments.
-For example:
+The macOS installer permits all `gh` and `az` commands. To limit commands, change `allow_rules`:
 
 ```toml
 allow_rules = ["gh pr view *", "head *"]
 ```
 
-This permits `gh pr view 123` and `head 10`, but does not permit other `gh`
-subcommands. A pattern such as `gh *` permits all `gh` invocations. Rules match
-the executable name and arguments in order, without matching shell operators.
+Rules match the executable name and arguments in order. They do not match shell operators.
+Patterns use shell-quoted words. The only wildcard is `*`, which can match across arguments.
+A trailing ` *` also matches a command with no arguments.
+The [example configuration](../examples/server.toml) gives more rules.
+
+Describe the intended use case in `description`:
+
+```toml
+description = "Use this tool for GitHub and Azure commands with the host user's authentication."
+```
+
+The tool description includes this text and the allowed command patterns.
+Authorization errors also list the patterns. This text does not grant permission to commands outside `allow_rules`.
 
 ## Shell expressions
 
-The server parses each expression as Bash syntax and checks every executable
-invocation before starting Bash or processing a redirection. Supported
-connectors are `;`, newline, `|`, `&&`, and `||`. Input `<`, output `>` and
-`>>`, and descriptor duplication `>&` and `<&` are supported for descriptors
-0, 1, and 2. Words must be literal; quote or escape special characters.
-Variable and command substitution, glob, brace and tilde expansion, loops,
-conditionals, subshells, background commands, and other unsupported syntax are
-rejected.
+A shell expression is one request with commands and operators.
+The server parses it as Bash syntax and authorizes every command before Bash starts or a redirection opens a file.
+Supported operators are `;`, newline, `|`, `&&`, and `||`.
+Supported redirections are `<`, `>`, `>>`, `>&`, and `<&`, for descriptors 0, 1, and 2.
 
-An allow rule grants the matched command its full host-user permissions,
-including file access and subprocesses; shell redirections can write files.
-The optional initialization file is trusted Bash-compatible code, runs for
-every request, and can define aliases or functions. Its runtime counts toward
-the request limit.
+Words must be literal. Quote or escape special characters.
+The server rejects variable and command substitution, glob, brace and tilde expansion, loops, conditionals, subshells, and background commands.
+
+Allowed commands retain all host-user permissions, including file access and subprocesses. Redirections can write files.
+The trusted initialization file runs before each expression and can define aliases or functions.
+Its execution time counts toward the request limit. Changes to this file apply to the next request.
 
 ## Timeouts and results
 
-The `execute` tool accepts optional `timeout_ms` from 1 to 86400000. The server
-uses the smaller of this value and `max_runtime_ms`; if omitted, it uses
-`max_runtime_ms`. Output is captured to temporary files while the command runs,
-then returned in the final MCP result. The server uses bounded memory while
-capturing and delivering output. Temporary files are closed and deleted after
-the response is delivered or the request is cancelled. Disk space and execution
-time remain finite resources. Set `max_output_bytes` to impose an optional
-combined limit; exceeding it stops the command and returns an execution error.
+The `execute` tool accepts `timeout_ms` from 1 to 86400000 milliseconds.
+The effective limit is the smaller of `timeout_ms` and `max_runtime_ms`.
+If `timeout_ms` is absent, the server uses `max_runtime_ms`.
 
-When a client supplies a standard MCP progress token, the server sends an
-`execution accepted` notification, then an `execution running` notification
-every second while the command runs. It also sends SSE keepalive comments during
-long requests, even when the client does not supply a progress token. These
-notifications report status; command output is returned in the final result,
-not as incremental stdout/stderr chunks.
-A timeout returns an execution error if the response can be delivered. A timeout
-or request cancellation stops the command process group with `SIGKILL` and waits
-for the direct child. A completed command returns `stdout`, `stderr`, and either
-`exit_code` or `signal`; a nonzero exit or signal is a tool error. Temporary-file
-creation and write failures stop the command and return an execution error.
+The server captures output in temporary files and returns it in the final result.
+Memory use stays bounded during capture and delivery. Disk use is limited only if you set `max_output_bytes`.
+If output exceeds that limit, the server stops the command and returns an error.
+Temporary files are closed and deleted after delivery or cancellation.
 
-Detached processes and processes the server cannot signal may survive
-cancellation. Network failures can delay cancellation detection.
+With an MCP progress token, the server sends `execution accepted`, then `execution running` every second.
+It also sends SSE keepalive comments during long requests, with or without a progress token.
+Command output arrives in the final result.
+
+Results contain `stdout`, `stderr`, and either `exit_code` or `signal`.
+A nonzero exit code or signal is a tool error. Capture errors also stop the command and return an error.
+Timeout and cancellation send `SIGKILL` to the process group and wait for the direct child.
+A timeout returns an error if the connection still permits a response.
+Detached processes and processes that the server cannot signal can survive cancellation. Network errors can delay cancellation detection.
+
+## Tool logs
+
+The server writes one JSON record per line to stdout. Tool logging is enabled by default.
+Each call has a server invocation ID, a client request ID, and a tool name.
+The start record contains the full tool request, including command arguments.
+
+The output summary contains the exit code or signal, byte counts, and the first 512 bytes of each output stream.
+The `truncated` field shows whether more output exists. The tool response still contains the complete command output.
+The final record contains elapsed time and the result status or error. Cancelled requests also produce a record.
+HTTP authentication headers and the server token verifier are not logged.
 
 ## macOS service
 
-The installer places the server at `~/.local/bin/mcp-shell`, its configuration
-and token files in `~/.config/mcp-shell/`, and its LaunchAgent at
-`~/Library/LaunchAgents/io.github.alexandru.mcp-shell.plist`. Logs are
-`~/Library/Logs/mcp-shell/stdout.log` and `stderr.log`.
+The installer creates `~/.local/bin/mcp-shell` and stores configuration and tokens in `~/.config/mcp-shell/`.
+The LaunchAgent file is `~/Library/LaunchAgents/io.github.alexandru.mcp-shell.plist`.
+Tool logs go to `~/Library/Logs/mcp-shell/stdout.log`. Startup messages and server errors go to `stderr.log`.
 
-Check service status and follow server errors with:
+Show service status and follow both logs:
 
 ```sh
 launchctl print "gui/$(id -u)/io.github.alexandru.mcp-shell"
-tail -f "$HOME/Library/Logs/mcp-shell/stderr.log"
+tail -f "$HOME/Library/Logs/mcp-shell/stdout.log" "$HOME/Library/Logs/mcp-shell/stderr.log"
 ```
 
-After changing `server.toml`, restart the service:
+After changing `server.toml`, restart mcp-shell. The LaunchAgent starts it again automatically:
 
 ```sh
 launchctl kill SIGTERM "gui/$(id -u)/io.github.alexandru.mcp-shell"
 ```
 
-The LaunchAgent starts it again automatically.
-
-To stop and remove the LaunchAgent, then remove its plist:
+To stop the service and remove its LaunchAgent:
 
 ```sh
 launchctl bootout "gui/$(id -u)/io.github.alexandru.mcp-shell"
 rm "$HOME/Library/LaunchAgents/io.github.alexandru.mcp-shell.plist"
 ```
 
-Remove `~/.local/bin/mcp-shell`, `~/.config/mcp-shell/`, and
-`~/Library/Logs/mcp-shell/` only if you also want to delete the installed
-binary, configuration, token, and logs.
+To remove the binary, configuration, tokens, and logs, also remove `~/.local/bin/mcp-shell`, `~/.config/mcp-shell/`, and `~/Library/Logs/mcp-shell/`.
 
 ## Ubuntu service
 
-The Ubuntu installer stores the binary at `~/.local/bin/mcp-shell`, the
-configuration and token files in `~/.config/mcp-shell/`, and the user unit at
-`~/.config/systemd/user/mcp-shell.service`. It enables user lingering so the
-service can run after logout. Logs go to the user journal.
+The installer creates `~/.local/bin/mcp-shell` and stores configuration and tokens in `~/.config/mcp-shell/`.
+The user service file is `~/.config/systemd/user/mcp-shell.service`.
+User lingering lets the service run after logout. Logs go to the user journal.
 
-Check status and follow logs with:
+Show service status and follow logs:
 
 ```sh
 systemctl --user status mcp-shell.service
 journalctl --user -u mcp-shell.service -f
 ```
 
-After changing `server.toml`, restart the service:
+After changing `server.toml`, restart mcp-shell:
 
 ```sh
 systemctl --user restart mcp-shell.service
 ```
 
-To stop the service and remove its unit while retaining the binary,
-configuration, and token:
+To stop the service and remove its unit:
 
 ```sh
 systemctl --user disable --now mcp-shell.service
@@ -150,7 +147,5 @@ rm "$HOME/.config/systemd/user/mcp-shell.service"
 systemctl --user daemon-reload
 ```
 
-The installer does not disable user lingering during removal because other user
-services may depend on it. Remove `~/.local/bin/mcp-shell` and
-`~/.config/mcp-shell/` only if you also want to delete the binary, configuration,
-and token.
+User lingering stays enabled because other services can depend on it.
+To remove the binary, configuration, and tokens, also remove `~/.local/bin/mcp-shell` and `~/.config/mcp-shell/`.

@@ -77,6 +77,7 @@ struct TestEnvironment<'a> {
 
 #[derive(Default)]
 struct ServerOptions<'a> {
+    description: Option<&'a str>,
     allowed_hosts: Option<&'a [&'a str]>,
     allowed_origins: &'a [&'a str],
     allow_rules: Option<&'a [&'a str]>,
@@ -253,6 +254,12 @@ impl ServerFixture {
             .map(|limit| format!("max_output_bytes = {}\n", limit.0))
             .unwrap_or_default();
         let mut optional_config = String::new();
+        if let Some(description) = options.description {
+            optional_config.push_str(&format!(
+                "description = {}\n",
+                serde_json::to_string(description)?
+            ));
+        }
         if let Some(path) = initialization_file.as_deref() {
             append_config_path(&mut optional_config, "initialization_file", path)?;
         }
@@ -271,12 +278,13 @@ impl ServerFixture {
         fs::write(&config_path, config)?;
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-shell"));
+        let stdout = File::create(directory.path.join("stdout.log"))?;
         command
             .arg("--config")
             .arg(&config_path)
             .current_dir(&directory.path)
             .env_clear()
-            .stdout(Stdio::null())
+            .stdout(Stdio::from(stdout))
             .stderr(Stdio::piped());
         for variable in options.environment {
             let value = match variable.value {
@@ -472,6 +480,10 @@ impl ServerFixture {
             .lock()
             .map_err(|_| io::Error::other("server stderr log lock was poisoned"))?;
         Ok(lines.join("\n"))
+    }
+
+    fn stdout_log(&self) -> io::Result<String> {
+        fs::read_to_string(self.directory.path.join("stdout.log"))
     }
 }
 
@@ -1345,6 +1357,335 @@ fn wait_for_progress_events(
 }
 
 #[test]
+fn logs_tool_calls_and_response_summaries() -> TestResult {
+    let mut server = ServerFixture::start_with_rules(
+        &[
+            "/usr/bin/printf *",
+            "/usr/bin/false *",
+            "/bin/kill -TERM 0",
+            "/bin/sleep *",
+        ],
+        4,
+    )?;
+    let text = format!("{}€\n\"", "a".repeat(510));
+    let command = format!("/usr/bin/printf '%s' '{text}'");
+    let cases = [
+        ("execute", tool_call_body(json!({"command": command}))),
+        ("execute", tool_call_body(json!({"command": "/usr/bin/false fail"}))),
+        ("execute", tool_call_body(json!({"command": "/bin/kill -TERM 0"}))),
+        ("execute", tool_call_body(json!({"command": "/bin/sleep 2", "timeout_ms": 20}))),
+        ("execute", tool_call_body(json!({"command": "/bin/echo denied"}))),
+        ("execute", tool_call_body(json!({"command": 7}))),
+        ("unknown", json!({"jsonrpc":"2.0", "id": 9, "method":"tools/call", "params":{"name":"unknown", "arguments":{}, "_meta":request_metadata()}}).to_string()),
+    ];
+    for (index, (name, body)) in cases.iter().enumerate() {
+        let response = server.post(
+            "tools/call",
+            Some(name),
+            body,
+            Some(TOKEN),
+            "127.0.0.1",
+            None,
+        )?;
+        if index == 0 {
+            assert_successful_stdout(&response, &text)?;
+        } else if index >= 5 {
+            assert_invalid_params(&response)?;
+        } else if index >= 3 {
+            assert_tool_error_without_output(&response, None)?;
+        } else {
+            assert_eq!(
+                response
+                    .mcp_message()?
+                    .pointer("/result/isError")
+                    .and_then(Value::as_bool),
+                Some(true)
+            );
+        }
+    }
+    server.stop()?;
+    let stdout = server.stdout_log()?;
+    let stderr = server.stderr_log()?;
+    for secret in [TOKEN, TOKEN_SHA256, "definitely-not-the-test-token"] {
+        assert!(!stdout.contains(secret));
+        assert!(!stderr.contains(secret));
+    }
+    let events = stdout
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.pointer("/fields/event").and_then(Value::as_str) == Some("tool_call_started")
+        })
+        .collect();
+    let finishes: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.pointer("/fields/event").and_then(Value::as_str) == Some("tool_call_finished")
+        })
+        .collect();
+    assert_eq!(starts.len(), cases.len());
+    assert_eq!(finishes.len(), cases.len());
+    for (start, (name, body)) in starts.iter().zip(&cases) {
+        let request: Value = serde_json::from_str(
+            start
+                .pointer("/fields/request")
+                .and_then(Value::as_str)
+                .ok_or_else(|| io::Error::other("missing request log"))?,
+        )?;
+        let input: Value = serde_json::from_str(body)?;
+        assert_eq!(request.get("arguments"), input.pointer("/params/arguments"));
+        assert_eq!(
+            start.pointer("/span/tool").and_then(Value::as_str),
+            Some(*name)
+        );
+        let id = start
+            .pointer("/span/invocation_id")
+            .ok_or_else(|| io::Error::other("missing invocation ID"))?;
+        assert!(start.pointer("/span/request_id").is_some());
+        assert_eq!(
+            finishes
+                .iter()
+                .filter(|finish| finish.pointer("/span/invocation_id") == Some(id))
+                .count(),
+            1
+        );
+        assert_eq!(
+            starts
+                .iter()
+                .filter(|other| other.pointer("/span/invocation_id") == Some(id))
+                .count(),
+            1
+        );
+    }
+    let output_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.pointer("/fields/event").and_then(Value::as_str) == Some("tool_output")
+        })
+        .collect();
+    assert_eq!(output_events.len(), 3);
+    let summary: Value = serde_json::from_str(
+        output_events
+            .first()
+            .ok_or_else(|| io::Error::other("missing output event"))?
+            .pointer("/fields/response")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("missing output summary"))?,
+    )?;
+    assert_eq!(
+        summary
+            .pointer("/termination/exit_code")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        summary.pointer("/stdout/bytes").and_then(Value::as_u64),
+        Some(u64::try_from(text.len())?)
+    );
+    assert_eq!(
+        summary
+            .pointer("/stdout/truncated")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        summary.pointer("/stdout/preview").and_then(Value::as_str),
+        Some(format!("{}�", "a".repeat(510)).as_str())
+    );
+    let failed: Value = serde_json::from_str(
+        output_events
+            .get(1)
+            .ok_or_else(|| io::Error::other("missing output event"))?
+            .pointer("/fields/response")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("missing output summary"))?,
+    )?;
+    assert_eq!(
+        failed
+            .pointer("/termination/exit_code")
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+    let signalled: Value = serde_json::from_str(
+        output_events
+            .get(2)
+            .ok_or_else(|| io::Error::other("missing output event"))?
+            .pointer("/fields/response")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("missing output summary"))?,
+    )?;
+    assert_eq!(
+        signalled
+            .pointer("/termination/signal")
+            .and_then(Value::as_i64),
+        Some(15)
+    );
+    for (index, expected) in [
+        (3, "command execution timed out"),
+        (4, "command is not allowed"),
+        (5, "expected command"),
+        (6, "unknown tool"),
+    ] {
+        let response = finishes
+            .get(index)
+            .ok_or_else(|| io::Error::other("missing finish event"))?
+            .pointer("/fields/response")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("missing response log"))?;
+        assert!(response.contains(expected), "{response}");
+    }
+    Ok(())
+}
+
+#[test]
+fn logs_bounded_output_previews_without_truncating_the_response() -> TestResult {
+    let contents = format!("{}€\n", "x".repeat(12_000));
+    let fixtures = [FixtureFile {
+        relative_path: "payload",
+        contents: &contents,
+    }];
+    let mut server = ServerFixture::start_with_options(ServerOptions {
+        allow_rules: Some(&["/bin/cat *"]),
+        additional_files: &fixtures,
+        ..ServerOptions::default()
+    })?;
+    let response = server.post(
+        "tools/call",
+        Some("execute"),
+        &tool_call_body(json!({"command": "/bin/cat payload; /bin/cat payload >&2"})),
+        Some(TOKEN),
+        "127.0.0.1",
+        None,
+    )?;
+    let message = response.mcp_message()?;
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/stdout")
+            .and_then(Value::as_str),
+        Some(contents.as_str())
+    );
+    assert_eq!(
+        message
+            .pointer("/result/structuredContent/stderr")
+            .and_then(Value::as_str),
+        Some(contents.as_str())
+    );
+    server.stop()?;
+    let log = server.stdout_log()?;
+    assert!(log.len() < 6_000, "unexpected log length: {}", log.len());
+    assert!(!log.contains(&contents));
+    let events = log
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let event = events
+        .iter()
+        .find(|event| event.pointer("/fields/event").and_then(Value::as_str) == Some("tool_output"))
+        .ok_or_else(|| io::Error::other("missing output summary"))?;
+    let summary: Value = serde_json::from_str(
+        event
+            .pointer("/fields/response")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("missing response field"))?,
+    )?;
+    for stream in ["stdout", "stderr"] {
+        assert_eq!(
+            summary
+                .pointer(&format!("/{stream}/bytes"))
+                .and_then(Value::as_u64),
+            Some(u64::try_from(contents.len())?)
+        );
+        assert_eq!(
+            summary
+                .pointer(&format!("/{stream}/truncated"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            summary
+                .pointer(&format!("/{stream}/preview"))
+                .and_then(Value::as_str),
+            Some("x".repeat(512).as_str())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn describes_configured_rules_and_repeats_them_in_policy_errors() -> TestResult {
+    for (rules, description, expected_patterns) in [
+        (
+            &["gh *", "az devops project list *"][..],
+            Some("Manage projects.\nRead their status."),
+            "Allowed command patterns:\n- `gh *`\n- `az devops project list *`",
+        ),
+        (
+            &["/usr/bin/printf '%s marker'"][..],
+            None,
+            "Allowed command patterns:\n- `/usr/bin/printf '%s marker'`",
+        ),
+        (
+            &[][..],
+            None,
+            "Allowed command patterns:\nNo commands are allowed.",
+        ),
+    ] {
+        let server = ServerFixture::start_with_options(ServerOptions {
+            allow_rules: Some(rules),
+            description,
+            ..ServerOptions::default()
+        })?;
+        let listed = server.post(
+            "tools/list",
+            None,
+            &tools_list_body(),
+            Some(TOKEN),
+            "127.0.0.1",
+            None,
+        )?;
+        let message = listed.mcp_message()?;
+        let tools = message
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| io::Error::other("missing tools"))?;
+        let tool = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("execute"))
+            .ok_or_else(|| io::Error::other("missing execute tool"))?;
+        let actual_description = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("missing tool description"))?;
+        let custom = description.map_or(String::new(), |text| format!("\n\n{text}"));
+        let expected_description = format!(
+            "Execute one authorized Bash-compatible shell expression.{custom}\n\nUse only commands that match the allowed patterns. Every command in an expression must match a pattern.\n\n{expected_patterns}"
+        );
+        assert_eq!(actual_description, expected_description);
+        let denied = server.post(
+            "tools/call",
+            Some("execute"),
+            &tool_call_body(json!({"command":"/bin/echo rejected"})),
+            Some(TOKEN),
+            "127.0.0.1",
+            None,
+        )?;
+        let expected_error = format!("command is not allowed\n\n{expected_patterns}");
+        assert_tool_error_without_output(&denied, Some(&expected_error))?;
+        assert_eq!(
+            denied
+                .mcp_message()?
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str),
+            Some(expected_error.as_str())
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn authenticates_with_bearer_token_and_does_not_log_credentials() -> TestResult {
     let mut server = ServerFixture::start()?;
     let body = tool_call_body(json!({"command": "/bin/echo authenticated"}));
@@ -1389,6 +1730,11 @@ fn authenticates_with_bearer_token_and_does_not_log_credentials() -> TestResult 
     let log = server.stderr_log()?;
     assert!(!log.contains(TOKEN));
     assert!(!log.contains("definitely-not-the-test-token"));
+    let stdout = server.stdout_log()?;
+    for secret in [TOKEN, TOKEN_SHA256, "definitely-not-the-test-token"] {
+        assert!(!stdout.contains(secret));
+        assert!(!log.contains(secret));
+    }
     Ok(())
 }
 
@@ -1756,7 +2102,7 @@ fn exact_allow_rule_preserves_argument_boundaries() -> TestResult {
         denied_message
             .pointer("/result/structuredContent/error")
             .and_then(Value::as_str),
-        Some("command is not allowed")
+        Some("command is not allowed\n\nAllowed command patterns:\n- `/usr/bin/printf %s marker`")
     );
     assert_eq!(
         denied_message.pointer("/result/structuredContent/stdout"),
@@ -2453,7 +2799,7 @@ fn strips_inherited_shell_hooks_and_keeps_configured_initialization() -> TestRes
 
 #[test]
 fn cancels_disconnected_clients_before_response_and_after_progress_event() -> TestResult {
-    let server = start_execution_server(1, RuntimeMilliseconds(30_000), DEFAULT_OUTPUT_LIMIT)?;
+    let mut server = start_execution_server(1, RuntimeMilliseconds(30_000), DEFAULT_OUTPUT_LIMIT)?;
     let marker = process_marker_path(&server);
     let before_response_marker_count = process_id_marker_count(&marker)?;
     let mut before_response = CurlClient::start(
@@ -2498,6 +2844,35 @@ fn cancels_disconnected_clients_before_response_and_after_progress_event() -> Te
     )?;
     after_progress.cancel()?;
     after_progress_group.wait_until_stopped(Duration::from_secs(5))?;
+    server.stop()?;
+    let log = server.stdout_log()?;
+    let events = log
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.pointer("/fields/event").and_then(Value::as_str) == Some("tool_call_started")
+        })
+        .collect();
+    assert_eq!(starts.len(), 2);
+    for start in starts {
+        let id = start
+            .pointer("/span/invocation_id")
+            .ok_or_else(|| io::Error::other("missing invocation ID"))?;
+        assert!(events.iter().any(|event| {
+            event.pointer("/span/invocation_id") == Some(id)
+                && (event.pointer("/fields/event").and_then(Value::as_str)
+                    == Some("tool_call_cancelled")
+                    || (event.pointer("/fields/event").and_then(Value::as_str)
+                        == Some("tool_call_finished")
+                        && event
+                            .pointer("/fields/response")
+                            .and_then(Value::as_str)
+                            .is_some_and(|response| response.contains("cancelled"))))
+        }));
+    }
     Ok(())
 }
 

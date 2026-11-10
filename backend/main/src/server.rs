@@ -28,12 +28,14 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::{
-    config::{Config, RuntimeLimit},
+    config::{AllowRule, Config, RuntimeLimit},
     delivery::{self, DeferredOutput},
     execution::Executor,
     policy,
+    tool_log::ToolInvocation,
 };
 
 pub(crate) async fn serve(config: Config) -> Result<(), ServerError> {
@@ -130,12 +132,28 @@ impl ServerHandler for CommandServer {
         schema.insert("additionalProperties".into(), json!(false));
         Ok(ListToolsResult::with_all_items(vec![Tool::new(
             "execute",
-            "Execute one authorized Bash-compatible shell expression.",
+            execute_description(&self.config),
             schema,
         )]))
     }
 
     async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let invocation = ToolInvocation::start(&request, &context.id);
+        let result = self
+            .execute_tool(request, context)
+            .instrument(invocation.span.clone())
+            .await;
+        invocation.finish(&result);
+        result
+    }
+}
+
+impl CommandServer {
+    async fn execute_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
@@ -152,7 +170,12 @@ impl ServerHandler for CommandServer {
             })?;
         let expression = match policy::authorize(&params.command, &self.config.allow_rules) {
             Ok(expression) => expression,
-            Err(error) => return Ok(tool_error(&error.to_string())),
+            Err(error) => {
+                return Ok(tool_error(&format!(
+                    "{error}\n\n{}",
+                    allowed_command_patterns(&self.config.allow_rules)
+                )));
+            }
         };
         let deferred_output = context
             .extensions
@@ -194,7 +217,8 @@ impl ServerHandler for CommandServer {
             execution.await
         };
         match result {
-            Ok(output) => {
+            Ok(mut output) => {
+                crate::tool_log::output_summary(&mut output).await;
                 let succeeded = output.succeeded();
                 deferred_output.store(output).await;
                 // The HTTP adapter serializes file-backed output after the SDK builds its envelope.
@@ -282,5 +306,32 @@ async fn protect(State(config): State<Arc<Config>>, request: Request, next: Next
 }
 
 fn tool_error(message: &str) -> CallToolResponse {
-    CallToolResult::structured_error(json!({"error": message})).into()
+    let mut result = CallToolResult::structured_error(json!({"error": message}));
+    result.content = vec![rmcp::model::ContentBlock::text(message)];
+    result.into()
+}
+
+fn execute_description(config: &Config) -> String {
+    let mut description = String::from("Execute one authorized Bash-compatible shell expression.");
+    if let Some(purpose) = &config.description {
+        description.push_str("\n\n");
+        description.push_str(purpose.as_str());
+    }
+    description.push_str("\n\nUse only commands that match the allowed patterns. Every command in an expression must match a pattern.\n\n");
+    description.push_str(&allowed_command_patterns(&config.allow_rules));
+    description
+}
+
+fn allowed_command_patterns(rules: &[AllowRule]) -> String {
+    let mut message = String::from("Allowed command patterns:");
+    if rules.is_empty() {
+        message.push_str("\nNo commands are allowed.");
+    } else {
+        for rule in rules {
+            message.push_str("\n- `");
+            message.push_str(rule.pattern());
+            message.push('`');
+        }
+    }
+    message
 }

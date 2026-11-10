@@ -18,6 +18,7 @@ pub struct Config {
     pub(crate) allowed_hosts: Vec<AllowedHost>,
     pub(crate) allowed_origins: Vec<AllowedOrigin>,
     pub(crate) allow_rules: Vec<AllowRule>,
+    pub(crate) description: Option<ToolDescription>,
     pub(crate) max_runtime_ms: RuntimeLimit,
     pub(crate) max_output_bytes: Option<OutputLimit>,
     pub(crate) max_concurrent: ConcurrencyLimit,
@@ -63,6 +64,7 @@ impl Config {
         };
         let allowed_origins = parse_all(raw.allowed_origins, AllowedOrigin::parse)?;
         let allow_rules = parse_all(raw.allow_rules, |value| AllowRule::parse(&value))?;
+        let description = raw.description.map(ToolDescription::parse).transpose()?;
         let max_runtime_ms = raw
             .max_runtime_ms
             .map(RuntimeLimit::from_millis)
@@ -89,6 +91,7 @@ impl Config {
             allowed_hosts,
             allowed_origins,
             allow_rules,
+            description,
             max_runtime_ms,
             max_output_bytes,
             max_concurrent,
@@ -167,7 +170,10 @@ impl AllowedOrigin {
 
 /// A validated wildcard pattern used to authorize an executable invocation.
 #[derive(Clone, PartialEq, Eq)]
-pub struct AllowRule(String);
+pub struct AllowRule {
+    source: String,
+    compiled: String,
+}
 
 impl AllowRule {
     pub(crate) fn parse(value: &str) -> Result<Self, ConfigError> {
@@ -191,11 +197,39 @@ impl AllowRule {
                 reason: "must contain at least one command word",
             });
         }
-        Ok(Self(words.join("\0")))
+        Ok(Self {
+            source: value.to_owned(),
+            compiled: words.join("\0"),
+        })
+    }
+
+    /// Returns the configured pattern with its original shell quoting.
+    pub(crate) fn pattern(&self) -> &str {
+        &self.source
     }
 
     /// Returns the compiled wildcard pattern.
     pub(crate) fn compiled_pattern(&self) -> &str {
+        &self.compiled
+    }
+}
+
+/// A nonempty description of the intended use of the execute tool.
+pub struct ToolDescription(String);
+
+impl ToolDescription {
+    fn parse(value: String) -> Result<Self, ConfigError> {
+        if value.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "description",
+                reason: "must contain non-whitespace text",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the configured description.
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -423,6 +457,8 @@ const TOKEN_HASH_ENV: &str = "MCP_SHELL_TOKEN_SHA256";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     bind: Option<SocketAddr>,
     #[serde(default)]

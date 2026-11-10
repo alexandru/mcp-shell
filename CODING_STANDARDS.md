@@ -4,6 +4,10 @@ These rules apply to the Rust code in this repository and use RFC 2119 keywords.
 
 Use the `rust-skills` and `code-refinements` skills when writing, reviewing, or refactoring Rust code.
 
+## Dependencies
+
+Third-party libraries MUST be popular and actively maintained. Before adding a dependency, examine evidence of adoption and recent upstream maintenance.
+
 ## Types
 
 Configuration fields and other domain values MUST use semantic types (e.g. `HttpPort`, `HttpStatusCode`), not bare primitives. Type aliases are the minimum; use newtypes when compiler-enforced distinctions or invariants are needed.

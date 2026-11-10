@@ -89,13 +89,14 @@ def load_installation() -> tuple[str, str]:
         "127.0.0.1:8090",
         "localhost:8090",
         "host.docker.internal:8090",
-        "host.docker.internal:8443",
     }
     require(
-        config.get("bind") == "127.0.0.1:8090"
+        config.get("bind") == "0.0.0.0:8090"
         and set(config.get("allowed_hosts", [])) == expected_hosts
         and config.get("allowed_origins") == []
         and config.get("allow_rules") == ["gh *", "az *"]
+        and config.get("description")
+        == "Use this tool for GitHub and Azure commands with authentication from the host user."
         and config.get("initialization_file") == str(init_path)
         and config.get("working_directory") == str(home),
         "server configuration",
@@ -113,7 +114,7 @@ def load_installation() -> tuple[str, str]:
         and token.encode("ascii") not in agent_bytes,
         "LaunchAgent configuration",
     )
-    return f"http://{config['bind']}/mcp", token
+    return "http://127.0.0.1:8090/mcp", token
 
 
 def post_request(

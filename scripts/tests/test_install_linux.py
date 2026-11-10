@@ -293,6 +293,10 @@ exit 2
         config_dir = self.home / ".config/mcp-shell"
         config = tomllib.loads((config_dir / "server.toml").read_text(encoding="utf-8"))
         self.assertEqual(config["allow_rules"], ["gh *", "az *"])
+        self.assertEqual(
+            config["description"],
+            "Use this tool for GitHub and Azure commands with authentication from the host user.",
+        )
         self.assertEqual(config["working_directory"], str(self.home))
         self.assertEqual(config["initialization_file"], str(config_dir / "init.bash"))
         self.assertEqual((config_dir / "init.bash").read_text(encoding="utf-8"), "# trusted test init\n")

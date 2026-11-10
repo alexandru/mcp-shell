@@ -78,6 +78,43 @@ fn defaults_bind_to_loopback_and_deny_every_command() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn parses_optional_tool_description_and_preserves_rule_text()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert!(Config::from_toml("", token_hash()?)?.description.is_none());
+    let config = Config::from_toml(
+        "description = \"Manage projects.\\nRead their status.\"\nallow_rules = [\"/usr/bin/printf '%s marker'\"]",
+        token_hash()?,
+    )?;
+    assert_eq!(
+        config.description.as_ref().map(|value| value.as_str()),
+        Some("Manage projects.\nRead their status.")
+    );
+    assert_eq!(
+        config.allow_rules.first().map(AllowRule::pattern),
+        Some("/usr/bin/printf '%s marker'")
+    );
+    assert!(crate::policy::authorize("/usr/bin/printf '%s marker'", &config.allow_rules).is_ok());
+    assert!(crate::policy::authorize("/usr/bin/printf %s marker", &config.allow_rules).is_err());
+    Ok(())
+}
+
+#[test]
+fn rejects_empty_and_non_string_tool_descriptions() -> Result<(), Box<dyn std::error::Error>> {
+    for description in ["", " ", "\n\t"] {
+        let document = format!("description = {}", serde_json::to_string(description)?);
+        assert!(matches!(
+            Config::from_toml(&document, token_hash()?),
+            Err(ConfigError::InvalidValue {
+                field: "description",
+                ..
+            })
+        ));
+    }
+    assert!(Config::from_toml("description = 42", token_hash()?).is_err());
+    Ok(())
+}
+
+#[test]
 fn parses_toml_and_token_verifier_together() -> Result<(), Box<dyn std::error::Error>> {
     let verifier = token_verifier();
     let config = Config::parse("allow_rules = [\"gh *\"]", &verifier)?;

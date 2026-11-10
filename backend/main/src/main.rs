@@ -4,6 +4,7 @@ mod execution;
 mod output;
 mod policy;
 mod server;
+mod tool_log;
 
 use std::{env, io, path::PathBuf, process::ExitCode};
 
@@ -35,6 +36,16 @@ fn run() -> Result<(), StartupError> {
         _ => return Err(StartupError::Arguments),
     };
     let config = Config::load(&path)?;
+    tracing_subscriber::fmt()
+        .json()
+        .with_span_list(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,mcp_shell=info".into()),
+        )
+        .with_writer(io::stdout)
+        .try_init()
+        .map_err(StartupError::Logging)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -45,6 +56,8 @@ fn run() -> Result<(), StartupError> {
 
 #[derive(Debug, Error)]
 enum StartupError {
+    #[error("could not start logging")]
+    Logging(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("usage: mcp-shell --config <server.toml>")]
     Arguments,
     #[error(transparent)]

@@ -358,7 +358,16 @@ printf '%s\n' "printf 'pipeline-ran\\n'"
         import tomllib
 
         config = tomllib.loads(server_config)
+        self.assertEqual(config["bind"], "0.0.0.0:8090")
+        self.assertEqual(
+            config["allowed_hosts"],
+            ["127.0.0.1:8090", "localhost:8090", "host.docker.internal:8090"],
+        )
         self.assertEqual(config["allow_rules"], ["gh *", "az *"])
+        self.assertEqual(
+            config["description"],
+            "Use this tool for GitHub and Azure commands with authentication from the host user.",
+        )
         self.assertEqual(config["working_directory"], str(self.home))
         self.assertEqual(config["initialization_file"], str(config_dir / "init.bash"))
         self.assertEqual(

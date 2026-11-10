@@ -299,6 +299,7 @@ install_linux_for_home() (
             printf 'allowed_hosts = ["127.0.0.1:8090", "localhost:8090", "host.docker.internal:8090", "host.docker.internal:8443"]\n'
             printf 'allowed_origins = []\n'
             printf 'allow_rules = ["gh *", "az *"]\n'
+            printf 'description = "Use this tool for GitHub and Azure commands with authentication from the host user."\n'
             printf 'initialization_file = "%s"\n' "$escaped_init"
             printf 'working_directory = "%s"\n' "$toml_home"
         } > "$server_config_tmp"; then

@@ -105,6 +105,8 @@ def load_installation() -> tuple[str, str, Path, Path, str]:
         and set(config.get("allowed_hosts", [])) == expected_hosts
         and config.get("allowed_origins") == []
         and config.get("allow_rules") == ["gh *", "az *"]
+        and config.get("description")
+        == "Use this tool for GitHub and Azure commands with authentication from the host user."
         and config.get("initialization_file") == str(init_path)
         and config.get("working_directory") == str(home),
         "server configuration",

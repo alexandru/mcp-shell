@@ -1,11 +1,11 @@
 # mcp-shell
 
 An authenticated MCP server that runs allowed Bash-compatible shell expressions
-as the operating-system user who starts it.
+as the user who starts it.
 
 ## Install on macOS
 
-Requires stable Rust/Cargo and Xcode Command Line Tools. Run as your logged-in
+Install stable Rust/Cargo and Xcode Command Line Tools. Run as your logged-in
 macOS user.
 
 ```sh
@@ -17,7 +17,7 @@ its per-user LaunchAgent.
 
 ## Install on Ubuntu
 
-Requires Ubuntu, stable Rust/Cargo, Git, OpenSSL, and build tools. Run as a
+Install stable Rust/Cargo, Git, OpenSSL, and build tools on Ubuntu. Run as a
 non-root user in a login session with a systemd user manager.
 
 ```sh
@@ -25,7 +25,7 @@ non-root user in a login session with a systemd user manager.
 ```
 
 The installer creates the configuration and token, starts the systemd user
-service, and enables user lingering for it to run after logout.
+service, and enables user lingering so it can run after logout.
 
 - [Connect a client](docs/client-connection.md)
 - [Configure commands and limits](docs/configuration.md)

@@ -1,9 +1,9 @@
 bind = "127.0.0.1:8090"
+description = "Use this tool to query GitHub and Azure DevOps through the authenticated host CLI tools."
 allowed_hosts = [
   "127.0.0.1:8090",
   "localhost:8090",
   "host.docker.internal:8090",
-  "host.docker.internal:8443",
   "mcp.example.com",
 ]
 allowed_origins = []

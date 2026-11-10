@@ -1,33 +1,32 @@
 # Install on Ubuntu
 
-The one-command installer supports Ubuntu. Run it as your non-root user from a
-login session with an active systemd user manager. It enables user lingering so
-the service can run after logout. Requires stable Rust/Cargo, Git, OpenSSL, and
-a C compiler. Install and authenticate any CLI tools you plan to allow as this
-same user; the installer does not install them.
+Install stable Rust/Cargo, Git, OpenSSL, and a C compiler on Ubuntu. Install and
+authenticate the CLI tools you allow as the same user. The installer does not
+install them. Run it as a non-root user from a login session with an active
+systemd user manager. It enables user lingering so the
+service can run after logout.
 
 ```sh
 /bin/bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/alexandru/mcp-shell/main/linux-install.sh | /bin/bash'
 ```
 
-The installer builds the server, creates `~/.local/bin/mcp-shell`, the
-configuration, initialization file, client token and server verifier in
-`~/.config/mcp-shell/`, and the user unit at
-`~/.config/systemd/user/mcp-shell.service`. It starts the service. It preserves
-your existing configuration, initialization file, and client token when run
-again.
+The installer builds `~/.local/bin/mcp-shell`. It creates the configuration,
+initialization file, client token, and server verifier in `~/.config/mcp-shell/`.
+It creates `~/.config/systemd/user/mcp-shell.service` and starts the user
+service. Later installs preserve the configuration, initialization file, and
+client token.
 
-Review `server.toml` to choose command rules and hosts, and edit `init.bash` for
-the CLI paths and trusted Bash-compatible setup. Initialization changes apply
-to the next request. Restart the service after changing `server.toml`. See
+Choose command rules and hosts in `server.toml`. Edit `init.bash` for CLI paths
+and trusted Bash-compatible setup. Initialization changes apply to the next
+request. After changing `server.toml`, restart the service. See
 [Configuration](configuration.md) for settings and service commands.
 
 ## Remote HTTPS
 
 For a remote client, point a DNS name such as `mcp.example.com` at the Ubuntu
-server and allow inbound ports 80 and 443 in its firewall and cloud security
-group. Caddy uses these ports to obtain and serve public HTTPS certificates;
-see its [automatic HTTPS requirements](https://caddyserver.com/docs/automatic-https#overview).
+server. Allow inbound ports 80 and 443 in its firewall and cloud security group.
+Caddy uses these ports to obtain and serve public HTTPS certificates. See its
+[automatic HTTPS requirements](https://caddyserver.com/docs/automatic-https#overview).
 Install Caddy using its [official Debian/Ubuntu package
 instructions](https://caddyserver.com/docs/install#debian-ubuntu-raspbian).
 
@@ -46,7 +45,7 @@ mcp.example.com {
 }
 ```
 
-Apply the Caddy configuration and check the service:
+Apply the Caddy configuration and examine the service status:
 
 ```sh
 sudo systemctl enable --now caddy
@@ -54,10 +53,10 @@ sudo systemctl reload caddy
 systemctl status caddy --no-pager
 ```
 
-See Caddy's [systemd service guide](https://caddyserver.com/docs/running#using-the-service).
+See the [Caddy systemd service guide](https://caddyserver.com/docs/running#using-the-service).
 
-In the client configuration, use `https://mcp.example.com/mcp`. Transfer
-`~/.config/mcp-shell/client-token` to the client through a private channel and
-provide its contents as the client's `MCP_SHELL_TOKEN` environment variable.
-Keep that raw token out of the server environment. See [Connect a Codex
-client](client-connection.md) for Codex configuration.
+Use `https://mcp.example.com/mcp` in the client configuration. Transfer
+`~/.config/mcp-shell/client-token` to the client through a private channel.
+Set `MCP_SHELL_TOKEN` in the client environment to the token contents. Keep the
+raw token out of the server environment. See
+[Connect a client](client-connection.md) for client configuration.
