@@ -407,6 +407,68 @@ printf '%s\n' "printf 'pipeline-ran\\n'"
         self.assertLess(log.index("cargo build"), log.index(f"launchctl print gui/501/{LABEL}"))
         self.assertGreaterEqual(log.count(f"launchctl print gui/501/{LABEL}"), 3)
 
+    def test_supplied_server_hash_is_used_without_client_token(self) -> None:
+        supplied_hash = "aBcDeF0123456789" * 4
+        self.env["MCP_SHELL_TOKEN_SHA256"] = supplied_hash
+        self.env["MCP_SHELL_TOKEN"] = "ignored-client-token"
+        self.write_tool("openssl", "#!/bin/sh\nexit 1\n")
+
+        result = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config_dir = self.home / ".config/mcp-shell"
+        verifier = config_dir / "server-token.sha256"
+        self.assertEqual(verifier.read_text(encoding="ascii"), supplied_hash)
+        self.assertEqual(verifier.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((config_dir / "client-token").exists())
+        plist_path = self.home / f"Library/LaunchAgents/{LABEL}.plist"
+        plist = plistlib.loads(plist_path.read_bytes())
+        self.assertEqual(plist["EnvironmentVariables"]["MCP_SHELL_TOKEN_SHA256"], supplied_hash)
+        self.assertNotIn("Client token:", result.stdout)
+        self.assertNotIn(supplied_hash, result.stdout + result.stderr)
+        self.assertNotIn(self.env["MCP_SHELL_TOKEN"], result.stdout + result.stderr)
+
+    def test_supplied_server_hash_preserves_invalid_client_token(self) -> None:
+        config_dir = self.home / ".config/mcp-shell"
+        config_dir.mkdir(parents=True)
+        client_token = config_dir / "client-token"
+        client_token.write_bytes(b"invalid token\n")
+        client_token.chmod(0o644)
+        self.env["MCP_SHELL_TOKEN_SHA256"] = "a" * 64
+
+        result = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(client_token.read_bytes(), b"invalid token\n")
+        self.assertEqual(client_token.stat().st_mode & 0o777, 0o644)
+        self.assertNotIn("Client token:", result.stdout)
+
+    def test_invalid_supplied_server_hash_never_starts_service(self) -> None:
+        for supplied_hash in ("", "a" * 63, "g" * 64, "a" * 63 + "\n"):
+            with self.subTest(supplied_hash=repr(supplied_hash)):
+                self.log.unlink(missing_ok=True)
+                self.env["MCP_SHELL_TOKEN_SHA256"] = supplied_hash
+                result = self.run_installer()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("MCP_SHELL_TOKEN_SHA256", result.stderr)
+                if supplied_hash:
+                    self.assertNotIn(supplied_hash, result.stdout + result.stderr)
+                self.assertFalse((self.home / ".config/mcp-shell/client-token").exists())
+                self.assertNotIn("launchctl bootstrap", self.read_log())
+
+    def test_client_environment_token_does_not_change_generated_token(self) -> None:
+        self.env["MCP_SHELL_TOKEN"] = "ignored-client-token"
+
+        result = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config_dir = self.home / ".config/mcp-shell"
+        self.assertEqual((config_dir / "client-token").read_text(encoding="ascii"), GENERATED_TOKEN)
+        self.assertEqual(
+            (config_dir / "server-token.sha256").read_text(encoding="ascii"),
+            hashlib.sha256(GENERATED_TOKEN.encode("ascii")).hexdigest(),
+        )
+
     def test_build_uses_compiler_host_when_cargo_target_environment_is_set(self) -> None:
         self.env["CARGO_BUILD_TARGET"] = "wasm32-unknown-unknown"
 

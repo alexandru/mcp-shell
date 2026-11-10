@@ -328,59 +328,68 @@ install_linux_for_home() (
         init_tmp=""
     fi
 
-    if [[ -e "$client_token" || -L "$client_token" ]]; then
-        if [[ ! -f "$client_token" ]]; then
-            installer_error "existing client-token is not a regular file"
-            return 1
-        fi
-        if IFS= read -r raw_token < "$client_token"; then
-            installer_error "existing client-token must be one line with no trailing newline"
-            return 1
-        fi
-        if [[ -z "$raw_token" ]]; then
-            installer_error "existing client-token is empty"
-            return 1
-        fi
-        token_bytes="$(LC_ALL=C wc -c < "$client_token")"
-        token_bytes="${token_bytes//[[:space:]]/}"
-        if [[ "$token_bytes" != "${#raw_token}" ]]; then
-            installer_error "existing client-token contains unsupported bytes"
+    if [[ ${MCP_SHELL_TOKEN_SHA256+x} ]]; then
+        verifier="$MCP_SHELL_TOKEN_SHA256"
+        if [[ ! "$verifier" =~ ^[[:xdigit:]]{64}$ ]]; then
+            unset verifier
+            installer_error "MCP_SHELL_TOKEN_SHA256 must be exactly 64 hexadecimal characters"
             return 1
         fi
     else
-        raw_token="$(openssl rand -hex 32 2>/dev/null)" || {
-            installer_error "could not generate a client token"
+        if [[ -e "$client_token" || -L "$client_token" ]]; then
+            if [[ ! -f "$client_token" ]]; then
+                installer_error "existing client-token is not a regular file"
+                return 1
+            fi
+            if IFS= read -r raw_token < "$client_token"; then
+                installer_error "existing client-token must be one line with no trailing newline"
+                return 1
+            fi
+            if [[ -z "$raw_token" ]]; then
+                installer_error "existing client-token is empty"
+                return 1
+            fi
+            token_bytes="$(LC_ALL=C wc -c < "$client_token")"
+            token_bytes="${token_bytes//[[:space:]]/}"
+            if [[ "$token_bytes" != "${#raw_token}" ]]; then
+                installer_error "existing client-token contains unsupported bytes"
+                return 1
+            fi
+        else
+            raw_token="$(openssl rand -hex 32 2>/dev/null)" || {
+                installer_error "could not generate a client token"
+                return 1
+            }
+            if [[ "${#raw_token}" -ne 64 || ! "$raw_token" =~ ^[[:xdigit:]]{64}$ ]]; then
+                installer_error "token generator returned an invalid value"
+                return 1
+            fi
+            client_token_tmp="$config_dir/.client-token.$$"
+            if ! printf '%s' "$raw_token" > "$client_token_tmp" \
+                || ! chmod 600 "$client_token_tmp" \
+                || ! mv -f "$client_token_tmp" "$client_token"; then
+                installer_error "could not install client-token"
+                return 1
+            fi
+            client_token_tmp=""
+        fi
+        if ! valid_header_token "$raw_token"; then
+            unset raw_token
+            installer_error "client-token must contain only HTTP-header-safe ASCII"
+            return 1
+        fi
+        digest_output="$(printf '%s' "$raw_token" | openssl dgst -sha256 -hex 2>/dev/null)" || {
+            unset raw_token
+            installer_error "could not calculate the server token verifier"
             return 1
         }
-        if [[ "${#raw_token}" -ne 64 || ! "$raw_token" =~ ^[[:xdigit:]]{64}$ ]]; then
-            installer_error "token generator returned an invalid value"
+        unset raw_token
+        verifier="${digest_output##*= }"
+        unset digest_output
+        if [[ "${#verifier}" -ne 64 || ! "$verifier" =~ ^[[:xdigit:]]{64}$ ]]; then
+            installer_error "SHA-256 utility returned an invalid verifier"
             return 1
         fi
-        client_token_tmp="$config_dir/.client-token.$$"
-        if ! printf '%s' "$raw_token" > "$client_token_tmp" \
-            || ! chmod 600 "$client_token_tmp" \
-            || ! mv -f "$client_token_tmp" "$client_token"; then
-            installer_error "could not install client-token"
-            return 1
-        fi
-        client_token_tmp=""
-    fi
-    if ! valid_header_token "$raw_token"; then
-        unset raw_token
-        installer_error "client-token must contain only HTTP-header-safe ASCII"
-        return 1
-    fi
-    digest_output="$(printf '%s' "$raw_token" | openssl dgst -sha256 -hex 2>/dev/null)" || {
-        unset raw_token
-        installer_error "could not calculate the server token verifier"
-        return 1
-    }
-    unset raw_token
-    verifier="${digest_output##*= }"
-    unset digest_output
-    if [[ "${#verifier}" -ne 64 || ! "$verifier" =~ ^[[:xdigit:]]{64}$ ]]; then
-        installer_error "SHA-256 utility returned an invalid verifier"
-        return 1
     fi
     verifier_tmp="$config_dir/.server-token.sha256.$$"
     if ! printf '%s' "$verifier" > "$verifier_tmp" \
@@ -391,7 +400,10 @@ install_linux_for_home() (
         return 1
     fi
     verifier_tmp=""
-    chmod 600 "$client_token" "$verifier_file"
+    if [[ ! ${MCP_SHELL_TOKEN_SHA256+x} ]]; then
+        chmod 600 "$client_token"
+    fi
+    chmod 600 "$verifier_file"
 
     binary_tmp="$bin_dir/.mcp-shell.$$"
     if ! install -m 755 "$work_dir/build/$native_target/release/mcp-shell" "$binary_tmp" \
@@ -472,8 +484,11 @@ install_linux_for_home() (
     printf '  %-20s  %s\n' \
         'Executable:' "$binary_file" \
         'Configuration:' "$server_config" \
-        'Initialization:' "$init_file" \
-        'Client token:' "$client_token" \
+        'Initialization:' "$init_file"
+    if [[ ! ${MCP_SHELL_TOKEN_SHA256+x} ]]; then
+        printf '  %-20s  %s\n' 'Client token:' "$client_token"
+    fi
+    printf '  %-20s  %s\n' \
         'Server verifier:' "$verifier_file" \
         'User service unit:' "$unit_file" \
         'Logs:' "$journal_command"
@@ -483,6 +498,7 @@ usage() {
     printf 'Usage: linux-install.sh [--ref REF] [--help]\n'
     printf 'Install mcp-shell for the current Ubuntu user and start its systemd user service.\n'
     printf 'REF can be a branch, tag, commit ID, or full ref; default: main.\n'
+    printf 'Set MCP_SHELL_TOKEN_SHA256 to use an existing server token verifier.\n'
 }
 
 main() {
