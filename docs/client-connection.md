@@ -1,6 +1,6 @@
-# Connect a Codex client
+# Connect a client
 
-## Client configuration
+## Codex configuration
 
 Merge this entry into the Codex user's `~/.codex/config.toml`:
 
@@ -16,6 +16,11 @@ mcp_2026_07_28 = true
 
 The installer creates the raw token at `~/.config/mcp-shell/client-token`.
 Keep it in the client environment, not in Codex TOML.
+
+`tool_timeout_sec = 75` gives each tool call 75 seconds to return a result.
+The server limits commands to 60 seconds by default.
+The extra 15 seconds allow time for the server to return the result.
+See the [official OpenAI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
 ## Codex on the Mac
 
@@ -119,3 +124,63 @@ proxy behavior](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)
 
 From Codex, run an allowed read-only command to verify connectivity and the
 host CLI's authentication.
+
+## OpenCode on the Mac
+
+These instructions use OpenCode V2 on the Mac that runs mcp-shell.
+The macOS installer starts the server automatically.
+It stores the client token at `~/.config/mcp-shell/client-token`.
+
+Merge this entry into `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "mcp-shell": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8090/mcp",
+        "protocol": "2026-07-28",
+        "oauth": false,
+        "headers": {
+          "Authorization": "Bearer {env:MCP_SHELL_TOKEN}"
+        },
+        "timeout": {
+          "execution": 75000
+        }
+      }
+    }
+  }
+}
+```
+
+If you use `opencode.jsonc`, merge the entry into that file instead.
+For access in one project, use `opencode.json` in that project.
+If you changed the server address, use that address in `url`.
+
+The `remote` type connects to the server through HTTP, even on the same Mac.
+The `protocol` field selects the MCP revision that mcp-shell requires.
+The `oauth: false` field disables browser sign-in.
+mcp-shell uses a bearer token, a secret sent in each request.
+
+The `timeout.execution` value is in milliseconds.
+It gives each tool call 75 seconds to return a result.
+See the [OpenCode MCP documentation](https://opencode.ai/docs/mcp-servers/).
+
+OpenCode reads `{env:MCP_SHELL_TOKEN}` from its environment.
+Keep the token out of the JSON file.
+See the [OpenCode configuration documentation](https://opencode.ai/docs/config/#variables).
+
+After you save the configuration, export the token in the terminal that starts OpenCode:
+
+```sh
+export MCP_SHELL_TOKEN="$(cat "$HOME/.config/mcp-shell/client-token")"
+opencode mcp list
+opencode
+```
+
+Make sure that `opencode mcp list` shows `mcp-shell` as connected.
+In OpenCode, request an allowed read-only command, such as `gh auth status`, through mcp-shell.
+This makes sure that the connection and the host CLI authentication work.
+If the connection fails, see [macOS service status and logs](configuration.md#macos-service).
