@@ -43,7 +43,9 @@ Describe the intended use case in `description`:
 description = "Use this tool for GitHub and Azure commands with the host user's authentication."
 ```
 
-The tool description includes this text and the allowed command patterns.
+The tool description starts with this text and includes the allowed command patterns.
+Put a short use case on the first line. OpenCode Code Mode shows only that line in its tool catalog.
+The server removes leading and trailing whitespace from the configured text.
 Authorization errors also list the patterns. This text does not grant permission to commands outside `allow_rules`.
 
 ## Shell expressions

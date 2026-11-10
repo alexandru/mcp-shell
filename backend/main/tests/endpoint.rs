@@ -1619,7 +1619,7 @@ fn describes_configured_rules_and_repeats_them_in_policy_errors() -> TestResult 
     for (rules, description, expected_patterns) in [
         (
             &["gh *", "az devops project list *"][..],
-            Some("Manage projects.\nRead their status."),
+            Some(" \nManage projects.\nRead their status.\n "),
             "Allowed command patterns:\n- `gh *`\n- `az devops project list *`",
         ),
         (
@@ -1659,10 +1659,13 @@ fn describes_configured_rules_and_repeats_them_in_policy_errors() -> TestResult 
             .get("description")
             .and_then(Value::as_str)
             .ok_or_else(|| io::Error::other("missing tool description"))?;
-        let custom = description.map_or(String::new(), |text| format!("\n\n{text}"));
+        let custom = description.map_or(String::new(), |text| format!("{}\n\n", text.trim()));
         let expected_description = format!(
-            "Execute one authorized Bash-compatible shell expression.{custom}\n\nUse only commands that match the allowed patterns. Every command in an expression must match a pattern.\n\n{expected_patterns}"
+            "{custom}Execute one authorized Bash-compatible shell expression.\n\nUse only commands that match the allowed patterns. Every command in an expression must match a pattern.\n\n{expected_patterns}"
         );
+        if description.is_some() {
+            assert_eq!(actual_description.lines().next(), Some("Manage projects."));
+        }
         assert_eq!(actual_description, expected_description);
         let denied = server.post(
             "tools/call",

@@ -214,18 +214,19 @@ impl AllowRule {
     }
 }
 
-/// A nonempty description of the intended use of the execute tool.
+/// A nonempty description of the intended use of the execute tool, without outer whitespace.
 pub struct ToolDescription(String);
 
 impl ToolDescription {
     fn parse(value: String) -> Result<Self, ConfigError> {
-        if value.trim().is_empty() {
+        let value = value.trim();
+        if value.is_empty() {
             return Err(ConfigError::InvalidValue {
                 field: "description",
                 reason: "must contain non-whitespace text",
             });
         }
-        Ok(Self(value))
+        Ok(Self(value.to_owned()))
     }
 
     /// Returns the configured description.

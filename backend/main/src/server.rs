@@ -312,11 +312,12 @@ fn tool_error(message: &str) -> CallToolResponse {
 }
 
 fn execute_description(config: &Config) -> String {
-    let mut description = String::from("Execute one authorized Bash-compatible shell expression.");
+    let mut description = String::new();
     if let Some(purpose) = &config.description {
-        description.push_str("\n\n");
         description.push_str(purpose.as_str());
+        description.push_str("\n\n");
     }
+    description.push_str("Execute one authorized Bash-compatible shell expression.");
     description.push_str("\n\nUse only commands that match the allowed patterns. Every command in an expression must match a pattern.\n\n");
     description.push_str(&allowed_command_patterns(&config.allow_rules));
     description

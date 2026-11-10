@@ -82,7 +82,7 @@ fn parses_optional_tool_description_and_preserves_rule_text()
 -> Result<(), Box<dyn std::error::Error>> {
     assert!(Config::from_toml("", token_hash()?)?.description.is_none());
     let config = Config::from_toml(
-        "description = \"Manage projects.\\nRead their status.\"\nallow_rules = [\"/usr/bin/printf '%s marker'\"]",
+        "description = \" \\nManage projects.\\nRead their status.\\n \"\nallow_rules = [\"/usr/bin/printf '%s marker'\"]",
         token_hash()?,
     )?;
     assert_eq!(
